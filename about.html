@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Maze</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; background: #f5f5f7; color: #1d1d1f; min-height: 100vh; padding: 24px 16px; }
+  h1 { font-size: 26px; font-weight: 700; margin-bottom: 4px; color: #1d1d1f; }
+  .subtitle { font-size: 14px; color: #6e6e73; margin-bottom: 24px; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 20px; }
+  .tab { padding: 7px 16px; border-radius: 20px; border: 1px solid #d2d2d7; background: #fff; font-size: 13px; cursor: pointer; color: #6e6e73; transition: all .15s; font-family: inherit; }
+  .tab:hover { border-color: #86868b; color: #1d1d1f; }
+  .tab.active { background: #1d1d1f; color: #fff; border-color: #1d1d1f; font-weight: 500; }
+
+  /* Sections */
+  .section { display: none; }
+  .section.active { display: block; }
+
+  /* Metric row */
+  .metric-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
+  .metric { background: #fff; border: 1px solid #e5e5ea; border-radius: 12px; padding: 14px; text-align: center; }
+  .metric-num { font-size: 28px; font-weight: 700; color: #1d1d1f; }
+  .metric-lbl { font-size: 12px; color: #6e6e73; margin-top: 3px; }
+
+  /* Arch box */
+  .arch-box { background: #fff; border: 1px solid #e5e5ea; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+  .arch-box-title { font-size: 13px; font-weight: 600; color: #1d1d1f; margin-bottom: 10px; }
+  .flow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .flow-step { background: #f5f5f7; border: 1px solid #e5e5ea; border-radius: 8px; padding: 7px 12px; font-size: 12px; line-height: 1.5; }
+  .flow-step span { display: block; color: #6e6e73; font-size: 11px; }
+  .flow-arrow { color: #86868b; font-size: 16px; }
+  .badge-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { padding: 4px 10px; border-radius: 8px; font-size: 12px; font-weight: 500; }
+  .b-purple { background: #f0eeff; color: #4b44a8; }
+  .b-teal   { background: #e0f7ef; color: #0a6a50; }
+  .b-amber  { background: #fff4e0; color: #7a4a0a; }
+  .b-coral  { background: #ffeee8; color: #6b2a10; }
+  .b-blue   { background: #e8f2ff; color: #1a4e99; }
+
+  /* Cards */
+  .card { background: #fff; border: 1px solid #e5e5ea; border-radius: 12px; padding: 14px 16px; margin-bottom: 10px; cursor: pointer; transition: border-color .15s; }
+  .card:hover { border-color: #86868b; }
+  .card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+  .q-label { font-size: 11px; font-weight: 600; color: #0071e3; background: #e8f2ff; padding: 3px 8px; border-radius: 6px; white-space: nowrap; margin-bottom: 6px; display: inline-block; }
+  .q-text { font-size: 14px; font-weight: 600; color: #1d1d1f; line-height: 1.5; }
+  .chevron { font-size: 12px; color: #86868b; transition: transform .2s; flex-shrink: 0; margin-top: 4px; }
+  .chevron.open { transform: rotate(90deg); }
+  .answer { display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid #f0f0f2; }
+  .answer.open { display: block; }
+  .answer p { font-size: 13px; color: #3a3a3c; line-height: 1.75; margin-bottom: 8px; }
+  .answer p:last-child { margin-bottom: 0; }
+  .answer strong { color: #1d1d1f; font-weight: 600; }
+  .answer code { font-family: "SF Mono", Consolas, monospace; font-size: 12px; background: #f5f5f7; padding: 2px 5px; border-radius: 4px; color: #1d1d1f; }
+
+  /* Tip box */
+  .tip-box { border-left: 3px solid #6e3fd4; padding: 10px 14px; background: #f8f5ff; border-radius: 0 10px 10px 0; margin-bottom: 10px; }
+  .tip-box p { font-size: 13px; color: #3a3a3c; line-height: 1.7; }
+  .tip-box strong { color: #1d1d1f; font-weight: 600; }
+
+  /* Print */
+  @media print {
+    body { background: #fff; padding: 16px; }
+    .tabs { display: none; }
+    .section { display: block !important; }
+    .section + .section { page-break-before: always; }
+    .answer { display: block !important; }
+    .chevron { display: none; }
+    .card { break-inside: avoid; }
+  }
+
+  /* Dark mode */
+  @media (prefers-color-scheme: dark) {
+    body { background: #1c1c1e; color: #f5f5f7; }
+    h1 { color: #f5f5f7; }
+    .subtitle { color: #86868b; }
+    .tab { background: #2c2c2e; border-color: #3a3a3c; color: #86868b; }
+    .tab.active { background: #f5f5f7; color: #1c1c1e; border-color: #f5f5f7; }
+    .metric, .arch-box, .card { background: #2c2c2e; border-color: #3a3a3c; }
+    .metric-num, .q-text, .answer strong { color: #f5f5f7; }
+    .metric-lbl, .flow-arrow, .chevron, .subtitle { color: #86868b; }
+    .arch-box-title, .arch-box-title { color: #f5f5f7; }
+    .flow-step { background: #1c1c1e; border-color: #3a3a3c; color: #f5f5f7; }
+    .flow-step span { color: #86868b; }
+    .answer { border-top-color: #3a3a3c; }
+    .answer p { color: #aeaeb2; }
+    .answer code { background: #1c1c1e; color: #f5f5f7; }
+    .card:hover { border-color: #636366; }
+    .tip-box { background: #2a1f3d; }
+    .tip-box p { color: #aeaeb2; }
+    .tip-box strong { color: #f5f5f7; }
+    .b-purple { background: #2d2260; color: #c9c2f5; }
+    .b-teal   { background: #0a3328; color: #7de0c0; }
+    .b-amber  { background: #3d2200; color: #f5c060; }
+    .b-coral  { background: #3d1505; color: #f5b09a; }
+    .b-blue   { background: #0a2040; color: #90bff5; }
+  }
+</style>
+</head>
+<body>
+
+<h1>AI Maze</h1>
+
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('overview', this)">Overview</button>
+  <button class="tab" onclick="switchTab('facerec', this)">Face recognition</button>
+  <button class="tab" onclick="switchTab('maze', this)">Maze & AI</button>
+  <button class="tab" onclick="switchTab('adaptive', this)">Adaptive system</button>
+  <button class="tab" onclick="switchTab('integration', this)">Integration</button>
+  <button class="tab" onclick="switchTab('tips', this)">Presentation</button>
+</div>
+
+<!-- OVERVIEW -->
+<div id="overview" class="section active">
+
+  <div class="metric-row">
+    <div class="metric"><div class="metric-num">3</div><div class="metric-lbl">core modules</div></div>
+    <div class="metric"><div class="metric-num">5</div><div class="metric-lbl">AI components</div></div>
+    <div class="metric"><div class="metric-num">15</div><div class="metric-lbl">face samples needed</div></div>
+  </div>
+
+  <div class="arch-box">
+    <div class="arch-box-title">System architecture</div>
+    <div class="flow">
+      <div class="flow-step">launch.py<span>Entry point</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">face_auth.py<span>Face login</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">final_mazeT.py<span>Game engine</span></div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">ai_maze_stats_*.json<span>Per-user data</span></div>
+    </div>
+  </div>
+
+  <div class="arch-box">
+    <div class="arch-box-title">AI components in this project</div>
+    <div class="badge-row">
+      <span class="badge b-purple">Haar cascade face detection</span>
+      <span class="badge b-teal">LBP texture recognition</span>
+      <span class="badge b-amber">ORB feature matching</span>
+      <span class="badge b-coral">A* pathfinding (enemies)</span>
+      <span class="badge b-blue">Adaptive difficulty director</span>
+    </div>
+  </div>
+
+</div>
+
+<!-- FACE RECOGNITION -->
+<div id="facerec" class="section">
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Mechanism</span>
+        <div class="q-text">mechanism of my face recognition system</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>The system has <strong>three stages</strong>: detection, feature extraction, and matching.</p>
+      <p><strong>1. Detection</strong> — OpenCV's Haar cascade classifier (<code>haarcascade_frontalface_default.xml</code>) scans the grayscale webcam frame using a sliding window. It looks for patterns of light/dark rectangles characteristic of frontal faces. If nothing is found, it retries with a looser scale factor.</p>
+      <p><strong>2. Feature extraction</strong> — The cropped face is resized to 160×160 and two descriptors are computed: <strong>LBP (Local Binary Patterns)</strong>, which encodes each pixel as a binary code based on its 8 neighbours, giving a texture fingerprint; and a <strong>multi-region intensity histogram</strong> that captures the overall brightness distribution across a 3×3 grid of regions.</p>
+      <p><strong>3. Matching</strong> — At login, the live features are compared to every stored sample using <strong>cosine similarity</strong>. The formula is: <code>0.45×LBP_sim + 0.45×hist_sim + 0.10×ORB_sim</code>. If the best score exceeds a threshold of <strong>0.32</strong>, the user is recognised.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Algorithm</span>
+        <div class="q-text">What is LBP and why did I choose it?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p><strong>Local Binary Patterns</strong> work by comparing each pixel to its 8 surrounding neighbours. If a neighbour is brighter or equal, it gets a <code>1</code>, otherwise <code>0</code>. The 8 bits form a code (0–255). These codes are then histogrammed across a 4×4 grid of face regions — giving a 512-dimensional feature vector.</p>
+      <p>LBP is chosen because it is <strong>illumination-invariant</strong> (it measures relative brightness, not absolute), it works without deep learning (no GPU, no heavy libraries), and it runs fast enough for real-time use — on a basic laptop camera at 30fps.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Algorithm</span>
+        <div class="q-text">What is ORB and how is it used here?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p><strong>ORB (Oriented FAST and Rotated BRIEF)</strong> is a keypoint detector and binary descriptor. It finds distinctive corner-like points on the face image and encodes them as 256-bit binary strings. Two face images are compared by matching these keypoints using a brute-force Hamming distance matcher.</p>
+      <p>In this system ORB contributes only <strong>10% weight</strong> in the final similarity score, because it can be noisy on small faces. It's a supplemental check on top of the more reliable LBP and histogram comparisons. The Lowe ratio test (<code>0.75</code>) is applied to filter out weak matches.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Registration</span>
+        <div class="q-text">How does the registration process work?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>The user types their name and clicks <strong>Capture Face</strong>. The system collects <strong>15 sample frames</strong> at 0.32-second intervals while the camera detects a face. Each frame is processed through the full feature pipeline (LBP + histogram + ORB). All 15 feature sets are stored together in a <code>users.pkl</code> pickle file under <code>face_data/</code>.</p>
+      <p>At login time, the live features are compared against all stored samples for each user. The <strong>top half</strong> of similarity scores are averaged, which makes recognition robust to a few bad samples (e.g. a blink or partial occlusion during registration).</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Low light</span>
+        <div class="q-text">How does the system handle poor lighting?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>Two mechanisms handle low light. First, <strong>CLAHE (Contrast Limited Adaptive Histogram Equalization)</strong> is applied to every face crop — it enhances local contrast without over-brightening. Second, if mean pixel brightness falls below <strong>45</strong>, a <strong>gamma correction LUT</strong> (gamma=0.45) brightens dark pixels non-linearly before detection.</p>
+      <p>There's also a "Torch" button in the UI that fills the screen with warm white, acting as a physical screen-light for very dark environments.</p>
+    </div>
+  </div>
+
+</div>
+
+<!-- MAZE & ENEMY AI -->
+<div id="maze" class="section">
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Algorithm</span>
+        <div class="q-text">How is the maze generated?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>The maze uses a <strong>recursive backtracker (DFS-based)</strong> algorithm. The grid starts as all walls. A <code>carve()</code> function starts at (1,1), randomly shuffles the 4 directions, and carves paths by setting both the step cell and intermediate wall cell to 0 (open). This continues recursively until all reachable cells are visited.</p>
+      <p>This guarantees a <strong>perfect maze</strong> — exactly one path between any two points, no loops. A <strong>22% loop factor</strong> is then applied: a random fraction of wall cells are opened, creating shortcuts and making the maze more interesting to explore.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Algorithm</span>
+        <div class="q-text">How does A* pathfinding work in your game?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p><strong>A* (A-star)</strong> is used for enemy navigation. It maintains an open set of cells. Each candidate gets a score <code>f = g + h</code>, where <code>g</code> is the actual distance from the start and <code>h</code> is the <strong>Manhattan distance heuristic</strong> to the goal. The cell with the lowest f-score is expanded first.</p>
+      <p>A* always finds the <strong>shortest path through the maze grid</strong>. Enemies call it each time they need to move. The result is a list of cells — the enemy takes the first step each movement tick.</p>
+      <p>The "blocker" enemy is special: instead of targeting the player directly, it runs A* toward a point <strong>along the player's path to the exit</strong> — trying to cut off the escape route.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">AI</span>
+        <div class="q-text">Explain the enemy FSM (Finite State Machine)</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>Each enemy is a <strong>Finite State Machine</strong> with four states: <strong>WANDER, PATROL, CHASE,</strong> and <strong>ATTACK</strong>.</p>
+      <p>Transitions are determined by Manhattan distance to the player, scaled by the current difficulty multiplier. A <strong>hunter</strong> switches to CHASE if the player is within <code>9 × difficulty</code> cells, and ATTACK within 2 cells. A <strong>blocker</strong> patrols near the exit and only chases if the player is within 14 cells.</p>
+      <p>In WANDER, enemies pathfind to a random distant cell. In PATROL, they follow a multi-point route. In CHASE/ATTACK, A* is called toward the target. A stun timer from player attacks forces the WANDER state temporarily.</p>
+      <p>Visual feedback: CHASE blends the enemy colour toward red, PATROL toward yellow, WANDER darkens it — so the player can read enemy intent at a glance.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Modes</span>
+        <div class="q-text">What are the three game modes and how do they differ?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p><strong>Lost in a Maze</strong> — Navigate from (1,1) to the exit at the bottom-right. The maze uses the recursive backtracker with 22% loop factor. Efficiency and time are tracked per level.</p>
+      <p><strong>Survival</strong> — An open field with sparse obstacles. Enemies spawn in waves; the player must survive as long as possible. The Adaptive Director continuously adjusts enemy count and speed.</p>
+      <p><strong>Night Out</strong> — Same as maze mode but with a <strong>circular spotlight effect</strong>: a dark overlay with an alpha-punched hole near the player. Only a small radius is visible, dramatically increasing difficulty. The spotlight is created by layering two SRCALPHA surfaces with <code>BLEND_RGBA_MIN</code> to produce a smooth gradient fade.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Scoring</span>
+        <div class="q-text">How is the score and efficiency calculated?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p><strong>Efficiency</strong> = <code>optimal_path_length / (optimal_path_length + wrong_moves)</code>. The optimal path is computed once via A* at level start. Every move not on the optimal path increments <code>wrong</code>. A perfect run gives efficiency = 1.0.</p>
+      <p><strong>Score</strong> = base points scaled by time and efficiency. Faster completions and fewer wrong turns give higher scores. The per-level result is stored in the user's JSON stats file, including mode, level, time, wrong count, efficiency, and score.</p>
+    </div>
+  </div>
+
+</div>
+
+<!-- ADAPTIVE SYSTEM -->
+<div id="adaptive" class="section">
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Core system</span>
+        <div class="q-text">Explain the adaptive difficulty system</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>There are <strong>two layers</strong> of adaptation: a per-session <strong>Adaptive Director</strong> and a cross-session <strong>Player Profile</strong>.</p>
+      <p>The <strong>AdaptiveDirector</strong> maintains a <code>skill</code> value (0–100) and a <code>difficulty</code> multiplier (0.40–1.60). Deaths reduce skill (penalty = <code>12 + death_streak × 6</code>). Clearing a wave increases it (bonus = <code>8 + wave_streak × 4</code>). The difficulty multiplier is lerp-interpolated toward a target with factor 0.35, so it changes smoothly.</p>
+      <p>The <strong>Player Profile</strong> uses historical stats across all sessions to classify the player into one of five types: Beginner, Balanced, SpeedRunner, LogicalPlanner, or Explorer — each getting different starting maze sizes, fog settings, and enemy counts.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Profiles</span>
+        <div class="q-text">How are player profiles determined?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>After at least 2 completed levels, <code>compute_profile()</code> classifies the player based on running averages:</p>
+      <p><strong>SpeedRunner</strong>: efficiency &gt; 80% AND average time &lt; 20s — gets larger mazes, faster enemies, more enemies.</p>
+      <p><strong>LogicalPlanner</strong>: wrong moves &lt; 3 AND efficiency &gt; 70% — gets fog of war enabled for challenging navigation.</p>
+      <p><strong>Explorer</strong>: more than 12 average wrong moves — gets very large mazes with fog, rewarding exploration playstyle.</p>
+      <p><strong>Balanced / Beginner</strong> get progressively growing mazes with moderate enemies. Profiles re-evaluate after every level, so the game adapts as the player improves.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Data</span>
+        <div class="q-text">How is per-user data stored and loaded?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>Each registered user gets a dedicated <strong>JSON file</strong> named <code>ai_maze_stats_{username}.json</code>. The filename is derived from the face-auth username — special characters are replaced with underscores and the name lowercased. Guests use <code>ai_maze_stats_guest.json</code>.</p>
+      <p>The file stores a <code>history</code> array of level results, each with: mode, level, time_s, wrong, efficiency, and score. Stats are loaded at game start and used to compute the player profile. After each level the new result is appended and saved. Each person's adaptive difficulty is therefore <strong>persistent across sessions</strong>.</p>
+    </div>
+  </div>
+
+</div>
+
+<!-- INTEGRATION -->
+<div id="integration" class="section">
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Architecture</span>
+        <div class="q-text">How does launch.py connect face auth to the game without modifying the game file?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p><code>launch.py</code> uses Python's <strong>importlib</strong> to load <code>final_mazeT.py</code> as a module at runtime rather than running it as a script. This means the game's <code>if __name__ == "__main__"</code> block is never executed — instead, the launcher calls <code>Game().run()</code> directly.</p>
+      <p>Before executing the module, it <strong>patches <code>SAVE_FILE</code></strong> directly on the module object, so the game saves to the logged-in user's file. It also <strong>monkey-patches</strong> <code>Game.build_menu</code> and <code>Game.draw_menu</code> to show a player name badge in the top-right corner — all without touching the original game file.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Design choice</span>
+        <div class="q-text">Why not just use dlib or face_recognition libraries?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>The design constraint was to avoid heavy dependencies. <code>dlib</code> requires compiled C++ binaries and a model download (~100MB). The <code>face_recognition</code> library depends on dlib. Both require specific OS-level build tools to install.</p>
+      <p>This system only needs <strong>OpenCV and NumPy</strong> — both standard pip installs with no compilation needed. The LBP + histogram approach achieves reliable recognition for a small, known user base (a classroom or team), which is the intended use case. The trade-off is that it would not scale to millions of users or handle large pose/lighting variations as well as deep learning methods.</p>
+    </div>
+  </div>
+
+  <div class="card" onclick="toggle(this)">
+    <div class="card-header">
+      <div>
+        <span class="q-label">Sound</span>
+        <div class="q-text">How is sound generated without any audio files?</div>
+      </div>
+      <span class="chevron">▶</span>
+    </div>
+    <div class="answer">
+      <p>All sound is <strong>procedurally generated at runtime</strong> using NumPy. Each sound effect is a mathematical formula applied to a time array — for example, the coin sound is a sine wave with rising frequency: <code>sin(2π × (600 + 500t) × t)</code> with an exponential decay envelope.</p>
+      <p>Background music is also generated per-mode by layering sine waves at different frequencies. Sounds are generated once, cached in a dictionary, and played via pygame.mixer. The entire game is <strong>self-contained in Python</strong> — zero asset files needed.</p>
+    </div>
+  </div>
+
+</div>
+
+<!-- TIPS -->
+<div id="tips" class="section">
+
+  <div class="tip-box">
+    <p><strong>Opening line suggestion:</strong> "This project combines two AI areas — computer vision for face recognition, and game AI for adaptive difficulty — in a single playable Python application."</p>
+  </div>
+
+  <div class="tip-box">
+    <p><strong>If asked "what was hardest":</strong> The face recognition threshold tuning (0.32) — too low and strangers log in, too high and the real user gets rejected. Also the spotlight effect in Night Out mode, which required compositing two alpha surfaces with a special blend flag (<code>BLEND_RGBA_MIN</code>).</p>
+  </div>
+
+  <div class="tip-box">
+    <p><strong>If asked "what would you improve":</strong> Replace LBP matching with a lightweight CNN (e.g. MobileNet) for better accuracy at varied angles. Add online learning so the model updates with new face samples over time. Also add a difficulty graph on the stats screen so players can visualise how their skill score changed over time.</p>
+  </div>
+
+  <div class="tip-box">
+    <p><strong>If asked about limitations:</strong> Face recognition only works reliably for frontal faces in reasonable lighting. The system stores raw feature vectors in a pickle file — not suitable for production (no encryption). LBP is also sensitive to large changes in appearance between registration and login (e.g. new glasses or hairstyle).</p>
+  </div>
+
+  <div class="tip-box">
+    <p><strong>Key terms to use confidently:</strong> cosine similarity, Haar cascade, Local Binary Patterns, CLAHE histogram equalization, gamma correction, A* heuristic, Finite State Machine, adaptive difficulty, player profiling, monkey-patching, procedural audio.</p>
+  </div>
+
+  <div class="tip-box">
+    <p><strong>For a live demo:</strong> Show registration first (so the face data is fresh), then login, then play one level of Night Out — it's the most visually impressive mode and immediately shows the spotlight effect. The colour-changing enemies also demonstrate the FSM visually without needing to explain it.</p>
+  </div>
+
+</div>
+
+<script>
+  function switchTab(name, btn) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+    document.getElementById(name).classList.add('active');
+    btn.classList.add('active');
+  }
+  function toggle(card) {
+    const ans = card.querySelector('.answer');
+    const chev = card.querySelector('.chevron');
+    ans.classList.toggle('open');
+    chev.classList.toggle('open');
+  }
+</script>
+
+</body>
+</html>
