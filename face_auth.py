@@ -1,17 +1,3 @@
-"""
-face_auth.py
-============
-Facial recognition login system for AI Maze.
-Uses OpenCV Haar cascade (detection) + histogram + ORB matching (recognition).
-No dlib / face_recognition / mediapipe required.
-
-Usage from launcher:
-    from face_auth import FaceAuthSystem
-    auth = FaceAuthSystem()
-    username = auth.run(screen, clock)   # returns str username or None (guest)
-    auth.shutdown()
-"""
-
 import os, cv2, pickle, threading, time, math
 import numpy as np
 import pygame
