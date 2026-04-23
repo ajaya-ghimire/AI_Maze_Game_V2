@@ -1,1376 +1,778 @@
+import os, cv2, pickle, threading, time, math
+import numpy as np
 import pygame
-import random
-import math
-import json
-import os
-import sys
-from dataclasses import dataclass, asdict, field
-from typing import List, Tuple, Dict, Optional
+from typing import Optional, Tuple, Dict, List
 
-# ═══════════════════════════════════════════════════
-#  CONFIG
-# ═══════════════════════════════════════════════════
-WIDTH, HEIGHT = 1280, 780
-FPS           = 60
-SAVE_FILE     = "ai_maze_stats.json"
-CELL_MIN, CELL_MAX = 12, 28
+# storage 
+FACES_DIR       = "face_data"
+USERS_FILE      = os.path.join(FACES_DIR, "users.pkl")
+SAMPLES_NEEDED  = 15     # frames grabbed during registration
+MATCH_THRESHOLD = 0.32   # combined similarity threshold
+ORB_RATIO       = 0.55   # kept for reference
+LOW_LIGHT_THRESH = 45    # mean pixel brightness below this = warn
+BOOST_GAMMA      = 0.45  # gamma <1 brightens dark frames
 
-# ── Palette ──────────────────────────────────────
-BG        = (6,   6,  12)
-PANEL     = (10,  10,  22)
-TEXT      = (220, 228, 240)
-MUTED     = (90,  105, 125)
-PURPLE    = (130,  55, 240)
-BLUE      = ( 50, 125, 250)
-CYAN      = ( 30, 210, 240)
-GREEN     = ( 30, 200,  90)
-GREEN_DIM = (  6,  55,  22)
-RED       = (240,  60,  60)
-ORANGE    = (250, 110,  20)
-YELLOW    = (248, 160,   8)
-GOLD      = (255, 200,  40)
-WALL_C    = ( 18,  28,  55)
-WALL_LIT  = ( 32,  48,  88)
-FLOOR_C   = ( 11,  11,  24)
-FOG_C     = (  2,   2,   5)
-SPOTLIGHT_COL = (255, 240, 200)
+# palette (mirrors game colours) 
+BG      = (6,   6,  12)
+PANEL   = (14,  14,  32)
+TEXT    = (220, 228, 240)
+MUTED   = (90,  105, 125)
+PURPLE  = (130,  55, 240)
+BLUE    = ( 50, 125, 250)
+CYAN    = ( 30, 210, 240)
+GREEN   = ( 30, 200,  90)
+RED     = (240,  60,  60)
+ORANGE  = (250, 110,  20)
+DARK_PU = ( 22,   8,  50)
+YELLOW  = (240, 210,  40)
+AMBER   = (255, 160,  20)
+TORCH   = (255, 252, 235)   
 
-MODE_NAMES = {
-    "maze":     "LOST IN A MAZE",
-    "survival": "SURVIVAL",
-    "nightout": "NIGHT OUT",
-}
-
-# ═══════════════════════════════════════════════════
-#  UTILITY
-# ═══════════════════════════════════════════════════
-def clamp(x, a, b): return max(a, min(b, x))
-def lerp(a, b, t):  return a + (b - a) * t
-def manhattan(a, b): return abs(a[0]-b[0]) + abs(a[1]-b[1])
-def blend(c1, c2, t):
-    t = clamp(t, 0, 1)
+def _blend(c1, c2, t):
+    t = max(0.0, min(1.0, t))
     return tuple(int(c1[i] + (c2[i]-c1[i])*t) for i in range(3))
 
-# ═══════════════════════════════════════════════════
-#  SOUND  (SFX + procedural music)
-# ═══════════════════════════════════════════════════
-class SoundSystem:
-    def __init__(self):
-        self.enabled   = False
-        self.music_on  = True
-        self._cache: Dict[str, object] = {}
-        self._music_ch = None   # dedicated pygame Channel for looping music
-        self._cur_track: Optional[str] = None
+def _font(size, bold=False):
+    for name in ("segoeui","helveticaneue","arial","consolas"):
         try:
-            pygame.mixer.pre_init(44100, -16, 2, 1024)
-            pygame.mixer.init()
-            pygame.mixer.set_num_channels(16)
-            self.enabled = True
-            self._music_ch = pygame.mixer.Channel(15)
+            f = pygame.font.SysFont(name, size, bold=bold)
+            if f: return f
         except Exception:
             pass
-
-    # ── sfx recipes ──────────────────────────────
-    def _gen(self, name):
-        try:
-            import numpy as np
-            sr = 44100
-            def make(dur, fn, vol=1.0):
-                t = np.linspace(0, dur, int(sr*dur), False)
-                w = np.clip(fn(t)*vol, -32000, 32000).astype(np.int16)
-                # stereo
-                stereo = np.column_stack([w, w])
-                return pygame.sndarray.make_sound(stereo)
-
-            recipes = {
-                # original
-                "move":        (0.030, lambda t: np.sin(2*np.pi*420*t)*np.exp(-t*110)*4000),
-                "wall":        (0.06,  lambda t: np.sin(2*np.pi*160*t+np.sin(60*t)*3)*np.exp(-t*70)*5500),
-                "coin":        (0.18,  lambda t: np.sin(2*np.pi*(600+500*t)*t)*np.exp(-t*22)*12000),
-                "kill":        (0.22,  lambda t: np.sin(2*np.pi*80*(1-t*1.4)*t*8)*np.exp(-t*11)*14000),
-                "damage":      (0.30,  lambda t: np.sin(2*np.pi*110*t+5*np.sin(14*t))*np.exp(-t*10)*15000),
-                "exit":        (0.60,  lambda t: np.sin(2*np.pi*(400+300*np.sin(4*t))*t)*np.exp(-t*3.5)*14000),
-                "death":       (0.80,  lambda t: np.sin(2*np.pi*80/(1+t*3)*t)*np.exp(-t*4)*16000),
-                "spawn":       (0.10,  lambda t: np.sin(2*np.pi*200*t)*(1-t/0.10)*5000),
-                # new sfx
-                "heal":        (0.35,  lambda t: (np.sin(2*np.pi*520*t)+np.sin(2*np.pi*780*t)*0.5)*np.exp(-t*8)*9000),
-                "levelup":     (0.70,  lambda t: np.sin(2*np.pi*(300+500*t/(0.70))*t)*np.exp(-t*2)*13000),
-                "wave_alert":  (0.45,  lambda t: np.sin(2*np.pi*220*t)*( np.sin(2*np.pi*3*t)*0.5+0.5)*np.exp(-t*4)*12000),
-                "attack_miss": (0.12,  lambda t: (np.random.default_rng(0).random(len(t))*2-1)*np.exp(-t*40)*6000),
-                "menu_click":  (0.07,  lambda t: np.sin(2*np.pi*700*t)*np.exp(-t*80)*7000),
-                "powerup":     (0.50,  lambda t: np.sin(2*np.pi*(250+600*(t/0.50)**2)*t)*np.exp(-t*3)*13000),
-                "wave_clear":  (0.55,  lambda t: (np.sin(2*np.pi*440*t)+np.sin(2*np.pi*550*t)+np.sin(2*np.pi*660*t))*np.exp(-t*4)*5000),
-                "attack_hit":  (0.18,  lambda t: (np.sin(2*np.pi*140*t)+np.random.default_rng(1).random(len(t))*0.3)*np.exp(-t*18)*13000),
-            }
-            if name not in recipes: return None
-            dur, fn = recipes[name]
-            return make(dur, fn)
-        except Exception:
-            return None
-
-    # ── procedural music ─────────────────────────
-    def _gen_music(self, track: str):
-        """Generate a looping background music clip (~4 s) per mode."""
-        try:
-            import numpy as np
-            sr = 44100
-            dur = 4.0
-            n   = int(sr * dur)
-            t   = np.linspace(0, dur, n, False)
-
-            def note(freq, start, end, amp=1.0, shape="sine"):
-                env = np.zeros(n)
-                s, e = int(start*sr), int(end*sr)
-                ln = e - s
-                if ln <= 0: return env
-                tt = np.linspace(0, end-start, ln, False)
-                attack = min(0.02*sr, ln//4)
-                release = min(0.04*sr, ln//3)
-                env_seg = np.ones(ln)
-                env_seg[:attack] = np.linspace(0,1,attack)
-                env_seg[-release:] = np.linspace(1,0,release)
-                if shape == "sine":
-                    wave = np.sin(2*np.pi*freq*tt)
-                elif shape == "square":
-                    wave = np.sign(np.sin(2*np.pi*freq*tt)) * 0.4
-                elif shape == "saw":
-                    wave = (2*(freq*tt % 1) - 1) * 0.5
-                else:
-                    wave = np.sin(2*np.pi*freq*tt)
-                env[s:e] = wave * env_seg * amp
-                return env
-
-            mix = np.zeros(n)
-
-            if track == "menu":
-                # Gentle ambient: slow arpeggios in C major
-                notes = [261.6, 329.6, 392.0, 523.3, 392.0, 329.6]
-                step  = dur / len(notes)
-                for i, f in enumerate(notes):
-                    mix += note(f, i*step, (i+1)*step-0.04, amp=0.35, shape="sine")
-                    mix += note(f*2, i*step+0.05, (i+1)*step-0.02, amp=0.12, shape="sine")
-                # bass drone
-                mix += note(65.4, 0, dur, amp=0.18, shape="sine")
-
-            elif track == "maze":
-                # Tense minor arpeggio (A minor)
-                pattern = [220, 261.6, 329.6, 261.6, 220, 196, 220, 261.6]
-                step = dur / len(pattern)
-                for i, f in enumerate(pattern):
-                    mix += note(f,     i*step,      (i+1)*step-0.03, amp=0.28, shape="sine")
-                    mix += note(f*2,   i*step+0.02, (i+1)*step-0.02, amp=0.10, shape="sine")
-                # bass pulse every half-beat
-                bass_f = [110, 110, 98, 110]
-                bs = dur / len(bass_f)
-                for i, f in enumerate(bass_f):
-                    mix += note(f, i*bs, i*bs+0.18, amp=0.30, shape="square")
-                # atmospheric pad
-                for f in [220, 277.2, 329.6]:
-                    mix += note(f, 0, dur, amp=0.06, shape="sine")
-
-            elif track == "survival":
-                # Driving pulse, D minor feel
-                kick_times = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
-                for kt in kick_times:
-                    mix += note(80, kt, kt+0.12, amp=0.50, shape="sine")
-                    mix += note(55, kt, kt+0.20, amp=0.30, shape="sine")
-                # bass line
-                bass = [146.8, 146.8, 130.8, 146.8, 164.8, 146.8, 130.8, 110.0]
-                bs = dur / len(bass)
-                for i, f in enumerate(bass):
-                    mix += note(f, i*bs, (i+1)*bs-0.04, amp=0.28, shape="square")
-                # tension melody
-                mel = [293.7, 329.6, 293.7, 261.6, 293.7, 329.6, 349.2, 293.7]
-                ms = dur / len(mel)
-                for i, f in enumerate(mel):
-                    mix += note(f, i*ms, (i+1)*ms-0.03, amp=0.16, shape="saw")
-
-            elif track == "nightout":
-                # Eerie sparse, E minor
-                mix += note(82.4, 0, dur, amp=0.14, shape="sine")   # deep drone
-                mix += note(164.8, 0, dur, amp=0.07, shape="sine")
-                sparse = [(0.0,164.8),(0.75,196.0),(1.5,185.0),(2.25,174.6),(3.0,164.8),(3.5,155.6)]
-                for st, f in sparse:
-                    mix += note(f, st, st+0.5, amp=0.22, shape="sine")
-                # high shimmer
-                for i in range(8):
-                    mix += note(1320 + i*40, i*0.5, i*0.5+0.08, amp=0.06, shape="sine")
-
-            # normalise & make stereo sound
-            peak = np.max(np.abs(mix))
-            if peak > 0:
-                mix = mix / peak * 18000
-            mix = np.clip(mix, -32000, 32000).astype(np.int16)
-            stereo = np.column_stack([mix, mix])
-            return pygame.sndarray.make_sound(stereo)
-        except Exception:
-            return None
-
-    def play_music(self, track: str):
-        if not self.enabled or not self.music_on: return
-        if track == self._cur_track: return
-        self._cur_track = track
-        key = f"_music_{track}"
-        if key not in self._cache:
-            self._cache[key] = self._gen_music(track)
-        s = self._cache.get(key)
-        if s and self._music_ch:
-            try:
-                self._music_ch.set_volume(0.45)
-                self._music_ch.play(s, loops=-1)
-            except Exception: pass
-
-    def stop_music(self):
-        if self._music_ch:
-            try: self._music_ch.stop()
-            except Exception: pass
-        self._cur_track = None
-
-    def play(self, name):
-        if not self.enabled: return
-        if name not in self._cache:
-            self._cache[name] = self._gen(name)
-        s = self._cache.get(name)
-        if s:
-            try: s.play()
-            except Exception: pass
-
-# ═══════════════════════════════════════════════════
-#  A*
-# ═══════════════════════════════════════════════════
-def astar(grid, start, goal):
-    rows, cols = len(grid), len(grid[0])
-    open_set = {start}
-    came = {}
-    g = {start: 0}
-    f = {start: manhattan(start, goal)}
-    dirs = [(0,1),(0,-1),(1,0),(-1,0)]
-    while open_set:
-        cur = min(open_set, key=lambda n: f.get(n, 1e9))
-        if cur == goal:
-            path = []
-            while cur in came:
-                path.append(cur); cur = came[cur]
-            path.reverse(); return path
-        open_set.remove(cur)
-        for dr,dc in dirs:
-            nr,nc = cur[0]+dr, cur[1]+dc
-            if 0<=nr<rows and 0<=nc<cols and grid[nr][nc]==0:
-                nxt=(nr,nc); tg=g[cur]+1
-                if tg < g.get(nxt,1e9):
-                    came[nxt]=cur; g[nxt]=tg
-                    f[nxt]=tg+manhattan(nxt,goal)
-                    open_set.add(nxt)
-    return []
-
-# ═══════════════════════════════════════════════════
-#  MAZE GENERATION
-# ═══════════════════════════════════════════════════
-def generate_maze(rows, cols, loop_factor=0.0):
-    if rows%2==0: rows+=1
-    if cols%2==0: cols+=1
-    sys.setrecursionlimit(max(10000, rows*cols*2))
-    grid    = [[1]*cols for _ in range(rows)]
-    visited = [[False]*cols for _ in range(rows)]
-
-    def carve(r, c):
-        visited[r][c] = True; grid[r][c] = 0
-        dirs = [(0,2),(0,-2),(2,0),(-2,0)]; random.shuffle(dirs)
-        for dr,dc in dirs:
-            nr,nc = r+dr, c+dc
-            if 0<nr<rows-1 and 0<nc<cols-1 and not visited[nr][nc]:
-                grid[r+dr//2][c+dc//2] = 0
-                carve(nr, nc)
-
-    carve(1,1)
-    grid[1][1] = grid[rows-2][cols-2] = 0
-
-    if loop_factor > 0:
-        walls = [(r,c) for r in range(1,rows-1) for c in range(1,cols-1) if grid[r][c]==1]
-        random.shuffle(walls)
-        for r,c in walls[:int(len(walls)*loop_factor)]:
-            grid[r][c] = 0
-    return grid
+    return pygame.font.Font(None, size)
 
 
-def generate_open_field(rows, cols, obstacle_rate=0.12):
-    grid = [[0]*cols for _ in range(rows)]
-    for r in range(rows): grid[r][0]=grid[r][cols-1]=1
-    for c in range(cols): grid[0][c]=grid[rows-1][c]=1
-    for _ in range(int(rows*cols*obstacle_rate)):
-        r=random.randint(1,rows-2); c=random.randint(1,cols-2)
-        grid[r][c]=1
-    cr,cc=rows//2,cols//2
-    for r in range(cr-3,cr+4):
-        for c in range(cc-3,cc+4):
-            if 0<=r<rows and 0<=c<cols: grid[r][c]=0
-    return grid
+# ══════════════════════════════════════════════════════════════════════════════
+#  FACE ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+class FaceEngine:
+    SIZE = 160
 
-# ═══════════════════════════════════════════════════
-#  ADAPTIVE AI
-# ═══════════════════════════════════════════════════
-@dataclass
-class LevelResult:
-    mode: str; level: int; time_s: int
-    wrong: int; efficiency: float; score: int
-
-@dataclass
-class StatsData:
-    history: List[LevelResult] = field(default_factory=list)
-    avg_time: float=30.0; avg_wrong: float=5.0
-    avg_eff: float=0.5;   levels: int=0
-
-def compute_profile(stats):
-    if stats.levels < 2: return "Beginner"
-    if stats.avg_eff > 0.80 and stats.avg_time < 20: return "SpeedRunner"
-    if stats.avg_wrong < 3  and stats.avg_eff > 0.70: return "LogicalPlanner"
-    if stats.avg_wrong > 12: return "Explorer"
-    return "Balanced"
-
-PROFILE_COLORS = {
-    "Beginner":       (90,180,90),
-    "Balanced":       (50,130,250),
-    "SpeedRunner":    (245,158,11),
-    "LogicalPlanner": (130,55,240),
-    "Explorer":       (30,210,240),
-}
-
-def difficulty_params(profile, level):
-    base = {
-        "Beginner":       dict(rows=17,cols=19,enemies=0,fog=False,speed=1.0),
-        "Balanced":       dict(rows=19,cols=21,enemies=1,fog=False,speed=1.0),
-        "SpeedRunner":    dict(rows=21,cols=23,enemies=2,fog=False,speed=1.5),
-        "LogicalPlanner": dict(rows=21,cols=23,enemies=1,fog=True, speed=1.0),
-        "Explorer":       dict(rows=23,cols=25,enemies=2,fog=True, speed=0.9),
-    }.get(profile, dict(rows=19,cols=21,enemies=1,fog=False,speed=1.0))
-    grow = (level-1)//2*2
-    return dict(
-        rows    = min(base["rows"]+grow, 33),
-        cols    = min(base["cols"]+grow, 37),
-        enemies = min(base["enemies"]+level//3, 4),
-        speed   = base["speed"]+(level-1)*0.08,
-        fog     = level>=5,
-    )
-
-class AdaptiveDirector:
-    """
-    Tracks deaths vs waves survived and adjusts difficulty so struggling
-    players get relief and dominant players get more pressure.
-    Skill 0->diff 0.40, 50->1.00, 100->1.60
-    """
     def __init__(self):
-        self.skill=50.0; self.difficulty=1.0
-        self.recent_damage=self.recent_kills=self.recent_coins=0
-        self.time_alive=0.0; self._history: List[float]=[]
-        self.death_streak=0; self.wave_streak=0; self.runs_this_session=0
-
-    def reset(self):
-        ds,ws,runs,sk,di,hi=(self.death_streak,self.wave_streak,
-            self.runs_this_session,self.skill,self.difficulty,self._history)
-        self.__init__()
-        self.death_streak=ds; self.wave_streak=ws; self.runs_this_session=runs
-        self.skill=sk; self.difficulty=di; self._history=hi
-
-    def tick(self,dt): self.time_alive+=dt
-    def report_damage(self,n=1): self.recent_damage+=n
-    def report_kill(self,n=1):   self.recent_kills+=n
-    def report_coin(self,n=1):   self.recent_coins+=n
-
-    def report_death(self):
-        self.death_streak+=1; self.wave_streak=0; self.runs_this_session+=1
-        penalty=12+self.death_streak*6
-        self.skill=clamp(self.skill-penalty,0,100); self._commit()
-
-    def report_wave_cleared(self):
-        self.wave_streak+=1; self.death_streak=0
-        bonus=8+self.wave_streak*4
-        self.skill=clamp(self.skill+bonus,0,100); self._commit()
-
-    def _commit(self):
-        target=0.40+(self.skill/100.0)*1.20
-        self.difficulty=lerp(self.difficulty,target,0.35)
-        self._history.append(self.difficulty)
-        if len(self._history)>80: self._history.pop(0)
-
-    def update_every(self):
-        delta=self.recent_kills*3+self.recent_coins*1.5-self.recent_damage*5
-        self.skill=clamp(lerp(self.skill,self.skill+delta,0.30),0,100)
-        self._commit()
-        self.recent_damage=self.recent_kills=self.recent_coins=0
-
-    @property
-    def diff_history(self): return self._history
-
-    @property
-    def ease_label(self):
-        if self.skill<25:  return "EASY MODE"
-        if self.skill<45:  return "EASING..."
-        if self.skill<60:  return "BALANCED"
-        if self.skill<80:  return "RAMPING"
-        return "HARD MODE"
-
-# ═══════════════════════════════════════════════════
-#  SAVE / LOAD
-# ═══════════════════════════════════════════════════
-def load_stats():
-    if not os.path.exists(SAVE_FILE): return StatsData()
-    try:
-        with open(SAVE_FILE) as f: data=json.load(f)
-        s=StatsData(history=[LevelResult(**x) for x in data.get("history",[])])
-        _rollup(s); return s
-    except Exception: return StatsData()
-
-def save_stats(stats):
-    with open(SAVE_FILE,"w") as f:
-        json.dump({"history":[asdict(h) for h in stats.history]},f,indent=2)
-
-def _rollup(s):
-    if not s.history:
-        s.avg_time=30.0;s.avg_wrong=5.0;s.avg_eff=0.5;s.levels=0;return
-    n=len(s.history); s.levels=n
-    s.avg_time =sum(h.time_s     for h in s.history)/n
-    s.avg_wrong=sum(h.wrong      for h in s.history)/n
-    s.avg_eff  =sum(h.efficiency for h in s.history)/n
-
-# ═══════════════════════════════════════════════════
-#  UI PRIMITIVES
-# ═══════════════════════════════════════════════════
-class Button:
-    def __init__(self,rect,text,primary=False,color=None):
-        self.rect=pygame.Rect(rect); self.text=text
-        self.primary=primary; self._color=color
-        self.hover=False; self._anim=0.0
-
-    def draw(self,surf,font):
-        if self._color:
-            bg=blend(self._color,(0,0,0),0.65); bgh=self._color; bord=self._color
-        elif self.primary:
-            bg=(60,15,150); bgh=(95,35,215); bord=(140,65,255)
-        else:
-            bg=(16,15,38); bgh=(28,25,70); bord=(42,40,82)
-        self._anim=lerp(self._anim,1.0 if self.hover else 0.0,0.20)
-        pygame.draw.rect(surf,blend(bg,bgh,self._anim),self.rect,border_radius=12)
-        pygame.draw.rect(surf,bord,self.rect,2,border_radius=12)
-        lbl=font.render(self.text,True,TEXT)
-        surf.blit(lbl,lbl.get_rect(center=self.rect.center))
-
-    def handle(self,events):
-        self.hover=self.rect.collidepoint(pygame.mouse.get_pos())
-        return any(e.type==pygame.MOUSEBUTTONDOWN and e.button==1 and self.hover for e in events)
-
-class Particle:
-    def __init__(self,x,y,vx,vy,color,life):
-        self.x=float(x); self.y=float(y); self.vx=vx; self.vy=vy
-        self.color=color; self.life=self.max_life=life
-    def update(self,dt):
-        self.x+=self.vx*dt; self.y+=self.vy*dt; self.vy+=55*dt; self.life-=dt
-        return self.life>0
-    def draw(self,surf):
-        t=self.life/self.max_life
-        pygame.draw.circle(surf,blend((0,0,0),self.color,t),(int(self.x),int(self.y)),max(1,int(t*4)))
-
-# ═══════════════════════════════════════════════════
-#  ENEMY FSM
-# ═══════════════════════════════════════════════════
-class FSMEnemy:
-    def __init__(self,r,c,kind,speed,color):
-        self.r=r; self.c=c; self.kind=kind; self.speed=speed; self.color=color
-        self.move_timer=0.0; self.state="WANDER"
-        self.wander_path=[]; self.patrol_path=[]; self.patrol_idx=0
-        self.stun_timer=0.0; self.flash_timer=0.0
-        self.visual_x=float(c); self.visual_y=float(r)
-
-    def update_visual(self,dt):
-        self.visual_x=lerp(self.visual_x,float(self.c),min(1.0,dt*14))
-        self.visual_y=lerp(self.visual_y,float(self.r),min(1.0,dt*14))
-        if self.flash_timer>0: self.flash_timer-=dt
-
-    def get_draw_color(self):
-        if self.flash_timer>0: return blend(self.color,(255,255,255),min(1.0,self.flash_timer*6))
-        if self.state=="CHASE":  return blend(self.color,RED,0.35)
-        if self.state=="WANDER": return blend(self.color,(30,30,30),0.35)
-        if self.state=="PATROL": return blend(self.color,YELLOW,0.25)
-        return self.color
-
-    def decide_state(self,player,difficulty):
-        d=manhattan((self.r,self.c),player)
-        if self.stun_timer>0: self.state="WANDER"; return
-        if self.kind=="hunter":
-            self.state="ATTACK" if d<=2 else ("CHASE" if d<=int(9*difficulty) else "WANDER")
-        elif self.kind=="blocker":
-            self.state="CHASE" if d<=14 else "PATROL"
-        elif self.kind=="zombie":
-            self.state="CHASE" if d<=int(6*difficulty) else "WANDER"
-        elif self.kind=="sentinel":
-            self.state="ATTACK" if d<=3 else ("CHASE" if d<=7 else "PATROL")
-
-    def step(self,grid,player,exit_pos,dt,difficulty):
-        if self.stun_timer>0: self.stun_timer-=dt; return
-        self.move_timer+=dt
-        if self.move_timer < max(0.07,0.30/(self.speed*difficulty)): return
-        self.move_timer=0.0
-        rows,cols=len(grid),len(grid[0])
-
-        if self.state in ("CHASE","ATTACK"):
-            target=player
-            if self.kind=="blocker" and exit_pos!=(-1,-1):
-                pp=astar(grid,player,exit_pos)
-                target=pp[min(3,len(pp)-1)] if len(pp)>=2 else (pp[-1] if pp else player)
-            path=astar(grid,(self.r,self.c),target)
-            if path: self.r,self.c=path[0]
-
-        elif self.state=="WANDER":
-            if not self.wander_path:
-                for _ in range(25):
-                    dr=random.randint(3,9); dc=random.randint(3,9)
-                    nr=clamp(self.r+random.choice([-dr,dr]),1,rows-2)
-                    nc=clamp(self.c+random.choice([-dc,dc]),1,cols-2)
-                    if grid[nr][nc]==0:
-                        p=astar(grid,(self.r,self.c),(nr,nc))
-                        if p: self.wander_path=p; break
-            if self.wander_path: self.r,self.c=self.wander_path.pop(0)
-
-        elif self.state=="PATROL":
-            if not self.patrol_path:
-                pts=[]; base=(self.r,self.c)
-                for _ in range(5):
-                    dr=random.randint(2,7)*random.choice([-1,1])
-                    dc=random.randint(2,7)*random.choice([-1,1])
-                    nr=clamp(self.r+dr,1,rows-2); nc=clamp(self.c+dc,1,cols-2)
-                    if grid[nr][nc]==0: pts.append((nr,nc))
-                if pts:
-                    full=[]; prev=base
-                    for pt in pts: full+=astar(grid,prev,pt); prev=pt
-                    self.patrol_path=full; self.patrol_idx=0
-            if self.patrol_path:
-                self.patrol_idx%=len(self.patrol_path)
-                self.r,self.c=self.patrol_path[self.patrol_idx]
-                self.patrol_idx=(self.patrol_idx+1)%len(self.patrol_path)
-
-    def stun(self,dur=0.9):
-        self.stun_timer=dur; self.flash_timer=0.45; self.state="WANDER"
-
-# ═══════════════════════════════════════════════════
-#  SPOTLIGHT SURFACE  (Night Out)
-# ═══════════════════════════════════════════════════
-def make_spotlight(radius, w, h, px, py):
-    """True circular spotlight: opaque darkness with a clear hole near the player."""
-    # Layer 1: full opaque darkness overlay
-    dark = pygame.Surface((w, h), pygame.SRCALPHA)
-    dark.fill((0, 0, 0, 220))
-
-    # Layer 2: punch a soft transparent hole using a dedicated circle surface
-    # Draw a radial gradient from fully transparent at centre to fully opaque at edge,
-    # then use BLEND_RGBA_MIN to cut it out of the darkness.
-    hole = pygame.Surface((w, h), pygame.SRCALPHA)
-    hole.fill((0, 0, 0, 0))  # start fully transparent
-    steps = radius
-    for i in range(steps, 0, -1):
-        frac = i / steps          # 1.0 at edge, ~0 at centre
-        # alpha ramps from 0 (centre = fully visible) to 220 (edge = fully dark)
-        a = int(220 * (frac ** 1.6))
-        pygame.draw.circle(hole, (0, 0, 0, a), (px, py), i)
-
-    # Blit hole onto dark surface so it *reduces* alpha where the hole is bright
-    dark.blit(hole, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
-    return dark
-
-# ═══════════════════════════════════════════════════
-#  GAME
-# ═══════════════════════════════════════════════════
-class Game:
-    def __init__(self):
-        pygame.init()
-        pygame.display.set_caption("AI Maze  —  Adaptive Director")
-        self.screen=pygame.display.set_mode((WIDTH,HEIGHT))
-        self.clock =pygame.time.Clock()
-
-        def _font(size,bold=False):
-            for name in ("segoeui","helveticaneue","arial","consolas"):
-                try:
-                    f=pygame.font.SysFont(name,size,bold=bold)
-                    if f: return f
-                except Exception: pass
-            return pygame.font.Font(None,size)
-
-        self.f_title = _font(58,bold=True)
-        self.f_big   = _font(44,bold=True)
-        self.f_med   = _font(22,bold=True)
-        self.f_ui    = _font(17)
-        self.f_small = _font(13)
-
-        self.snd=SoundSystem()
-
-        # state
-        self.running=True; self.screen_state="menu"
-        self.mode=None; self.select_mode=None
-        self.adaptive_on=True; self.sound_on=True
-
-        self.stats  =load_stats()
-        self.profile=compute_profile(self.stats)
-        self.director=AdaptiveDirector(); self._dir_t=0.0
-
-        # play vars
-        self.level=1; self.grid=None; self.rows=self.cols=0
-        self.cell=20; self.grid_origin=(30,100)
-        self.player=(1,1); self.exit=(1,1)
-        self.enemies: List[FSMEnemy]=[]
-        self.coins:   List[Tuple[int,int]]=[]
-        self.hearts:  List[Tuple[int,int]]=[]  # health heart pickups
-        self.particles: List[Particle]=[]
-        self.heatmap: Optional[List[List[int]]]=None
-
-        self.fog=False; self.fog_radius=4  # survival: no fog
-        self.nightout_radius=80
-
-        self.start_ticks=0; self.elapsed_s=0
-        self.wrong=0; self.path_len=0; self.opt_len=1; self.score=0
-        self.hp=5; self.max_hp=5
-        self.spawn_timer=0.0; self.wave=1; self.wave_timer=0.0
-        self.invuln_timer=0.0
-        self._mv_cd=0.0; self._mv_rate=0.09   # faster movement (was 0.12)
-        self.apoc_difficulty="Medium"
-        self.wave_alert_shown=False  # flash banner on new wave
-
-        self.build_menu()
-
-    # ── helpers ──────────────────────────────────
-    def blit(self,txt,pos,font,color):
-        self.screen.blit(font.render(txt,True,color),pos)
-
-    def blit_c(self,txt,cx,y,font,color):
-        s=font.render(txt,True,color)
-        self.screen.blit(s,(cx-s.get_width()//2,y))
-
-    def _cell_center(self,r,c):
-        ox,oy=self.grid_origin
-        return ox+c*self.cell+self.cell//2, oy+r*self.cell+self.cell//2
-
-    def _emit(self,x,y,color,n=10,spd=90):
-        for _ in range(n):
-            a=random.uniform(0,math.tau); v=random.uniform(18,spd)
-            self.particles.append(Particle(x,y,math.cos(a)*v,math.sin(a)*v,color,random.uniform(0.3,0.7)))
-
-    # ── menu ─────────────────────────────────────
-    def build_menu(self):
-        cx=WIDTH//2; top=300; w,h,gap=400,54,15
-        self.menu_btns=[
-            Button((cx-w//2,top+0*(h+gap),w,h),"SELECT LEVEL",primary=True),
-            Button((cx-w//2,top+1*(h+gap),w,h),"STATS"),
-            Button((cx-w//2,top+2*(h+gap),w,h),f"ADAPTIVE AI:  {'ON ' if self.adaptive_on else 'OFF'}"),
-            Button((cx-w//2,top+3*(h+gap),w,h),f"SOUND:  {'ON ' if self.sound_on else 'OFF'}"),
-            Button((cx-w//2,top+4*(h+gap),w,h),"EXIT"),
-        ]
-
-    # ── init modes ───────────────────────────────
-    def init_maze(self,lvl):
-        self.mode="maze"; self.level=lvl
-        prof=self.profile if self.adaptive_on else "Balanced"
-        p=difficulty_params(prof,lvl)
-        self.rows,self.cols=p["rows"],p["cols"]
-        # 22% loop factor = many extra corridors to roam
-        self.grid=generate_maze(self.rows,self.cols,loop_factor=0.22)
-        self.player=(1,1); self.exit=(self.rows-2,self.cols-2)
-        self.grid[self.exit[0]][self.exit[1]]=0
-        opt=astar(self.grid,self.player,self.exit); self.opt_len=max(1,len(opt))
-        self.enemies=[]
-        for i in range(p["enemies"]):
-            kind="hunter" if i==0 else ("blocker" if i==1 else "sentinel")
-            color=RED if kind=="hunter" else (ORANGE if kind=="blocker" else YELLOW)
-            er,ec=self._place_far(8)
-            self.enemies.append(FSMEnemy(er,ec,kind,p["speed"],color))
-        self.fog=p["fog"]; self.coins=[]
-        self._scatter_coins(5)
-        self._reset_run(keep_score=True)
-        self.snd.play_music("maze")
-
-    def init_survival(self):
-        self.mode="survival"; self.level=1; self.wave=1
-        dm={"Easy":0.7,"Medium":1.0,"Hard":1.4}.get(self.apoc_difficulty,1.0)
-        self.rows,self.cols=31,43
-        self.grid=generate_open_field(self.rows,self.cols,0.13)
-        self.player=(self.rows//2,self.cols//2)
-        self.grid[self.player[0]][self.player[1]]=0
-        self.exit=(-1,-1); self.enemies=[]; self.coins=[]
-        self.hp=self.max_hp=5
-        self.fog=False  # survival is always fully visible
-        self.director.reset(); self.director.difficulty=1.0*dm
-        self._reset_run(keep_score=False)
-        self.spawn_timer=self.wave_timer=0.0
-        self._scatter_coins(10)   # coins in survival
-        self._scatter_hearts(7)
-        for _ in range(3): self._spawn_survival("zombie")
-        self.snd.play_music("survival")
-
-    def init_nightout(self):
-        self.mode="nightout"; self.level=1; self.wave=1
-        dm={"Easy":0.7,"Medium":1.0,"Hard":1.4}.get(self.apoc_difficulty,1.0)
-        self.rows,self.cols=33,47
-        self.grid=generate_open_field(self.rows,self.cols,0.08)
-        self.player=(self.rows//2,self.cols//2)
-        self.grid[self.player[0]][self.player[1]]=0
-        self.exit=(-1,-1); self.enemies=[]; self.coins=[]
-        self.hp=self.max_hp=5
-        self.director.reset(); self.director.difficulty=1.0*dm
-        self._reset_run(keep_score=False)
-        self.spawn_timer=self.wave_timer=0.0
-        self._scatter_coins(14)   # many coins to find in the dark
-        self._scatter_hearts(4)
-        for _ in range(2): self._spawn_survival("zombie")
-        self.snd.play_music("nightout")
-
-    def _reset_run(self,keep_score=True):
-        self.start_ticks=pygame.time.get_ticks()
-        self.elapsed_s=self.wrong=self.path_len=0
-        self.invuln_timer=0.0; self.particles=[]; self.hearts=[]
-        self.wave_alert_shown=False
-        if hasattr(self,'_wave_banner_t'): self._wave_banner_t=0.0
-        if not keep_score: self.score=0
-        self.heatmap=[[0]*self.cols for _ in range(self.rows)]
-        # Give more space for survival/nightout (no right-panel)
-        mw = WIDTH - 30
-        mh = HEIGHT - 140
-        self.cell = clamp(min(mw // self.cols, mh // self.rows), CELL_MIN, CELL_MAX)
-        # Centre the grid horizontally
-        grid_w = self.cols * self.cell
-        grid_h = self.rows * self.cell
-        self.grid_origin = ((WIDTH - grid_w) // 2, 105)
-        self.nightout_radius = int(self.cell * 6)
-
-    # ── helpers ───────────────────────────────────
-    def _place_far(self,safe=10):
-        for _ in range(400):
-            r=random.randint(1,self.rows-2); c=random.randint(1,self.cols-2)
-            if self.grid[r][c]==1: continue
-            if (r,c)==self.player or (r,c)==self.exit: continue
-            if manhattan((r,c),self.player)<safe: continue
-            if astar(self.grid,(r,c),self.player): return r,c
-        return self.rows-3,self.cols-3
-
-    def _scatter_coins(self,n):
-        attempts=0
-        while len(self.coins)<n and attempts<n*8:
-            attempts+=1
-            r=random.randint(1,self.rows-2); c=random.randint(1,self.cols-2)
-            if self.grid[r][c]==0 and (r,c)!=self.player and (r,c)!=self.exit \
-               and (r,c) not in self.coins:
-                self.coins.append((r,c))
-
-    def _scatter_hearts(self, n):
-        """Place n health-heart pickups at random walkable cells."""
-        attempts = 0
-        while len(self.hearts) < n and attempts < n * 10:
-            attempts += 1
-            r = random.randint(1, self.rows-2)
-            c = random.randint(1, self.cols-2)
-            if (self.grid[r][c]==0 and (r,c)!=self.player
-                    and (r,c) not in self.coins and (r,c) not in self.hearts):
-                self.hearts.append((r, c))
-
-    def _in_fog(self,r,c):
-        if not self.fog: return True
-        pr,pc=self.player
-        return abs(r-pr)<=self.fog_radius and abs(c-pc)<=self.fog_radius
-
-    def _in_spotlight(self,r,c):
-        pr,pc=self.player
-        return abs(r-pr)<=self.fog_radius+1 and abs(c-pc)<=self.fog_radius+1
-
-    def _spawn_survival(self,kind="zombie"):
-        diff=self.director.difficulty if self.adaptive_on else 1.0
-        speed=0.8+(diff-0.7)*0.75
-        color=RED if kind=="zombie" else ORANGE
-        for _ in range(300):
-            side=random.choice(["top","bot","left","right"])
-            r=(1 if side=="top" else self.rows-2 if side=="bot" else random.randint(1,self.rows-2))
-            c=(1 if side=="left" else self.cols-2 if side=="right" else random.randint(1,self.cols-2))
-            if self.grid[r][c]==1: continue
-            if manhattan((r,c),self.player)<14: continue
-            e=FSMEnemy(r,c,kind,speed,color); e.state="WANDER"
-            self.enemies.append(e); self.snd.play("spawn"); return
-
-    # ── movement ─────────────────────────────────
-    def _try_move(self,dr,dc):
-        nr=self.player[0]+dr; nc=self.player[1]+dc
-        if nr<0 or nr>=self.rows or nc<0 or nc>=self.cols or self.grid[nr][nc]==1:
-            self.wrong+=1; self.snd.play("wall"); return
-        self.player=(nr,nc); self.path_len+=1
-        if self.heatmap and nr<len(self.heatmap) and nc<len(self.heatmap[nr]):
-            self.heatmap[nr][nc]+=1
-        if (nr,nc) in self.coins:
-            self.coins.remove((nr,nc)); self.score+=50
-            self.director.report_coin(1)
-            cx,cy=self._cell_center(nr,nc)
-            self._emit(cx,cy,GOLD,14,110); self.snd.play("coin")
-            if self.mode in ("survival","nightout"): self._scatter_coins(1)
-        if (nr,nc) in self.hearts:
-            self.hearts.remove((nr,nc))
-            if self.hp < self.max_hp:
-                self.hp += 1
-                cx2,cy2=self._cell_center(nr,nc)
-                self._emit(cx2,cy2,(255,80,120),14,90)
-                self.snd.play("heal")   # proper heal sound
-            # respawn a new heart somewhere else
-            if self.mode in ("survival","nightout"): self._scatter_hearts(1)
-
-        if self.invuln_timer<=0 and any(e.r==nr and e.c==nc for e in self.enemies):
-            self._take_damage()
-        if self.mode=="maze" and self.player==self.exit:
-            self.snd.play("levelup"); self._finish_maze()
-
-    def _take_damage(self):
-        if self.invuln_timer>0: return
-        self.hp-=1; self.invuln_timer=2.0   # was 1.3, more forgiveness
-        self.director.report_damage(1)
-        pr,pc=self.player; cx,cy=self._cell_center(pr,pc)
-        self._emit(cx,cy,RED,18,130); self.snd.play("damage")
-        if self.hp<=0:
-            self.snd.play("death")
-            self.snd.stop_music()
-            if self.adaptive_on: self.director.report_death()
-            self.screen_state="gameover"
-
-    def _player_attack(self):
-        if not self.enemies: self.snd.play("attack_miss"); return
-        pr,pc=self.player
-        # collect all enemies within range 7, sorted by distance
-        in_range=sorted(
-            [(manhattan((pr,pc),(e.r,e.c)),i,e) for i,e in enumerate(self.enemies)
-             if manhattan((pr,pc),(e.r,e.c))<=7],
-            key=lambda x: x[0]
+        self.cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
-        if not in_range: self.snd.play("attack_miss"); return
-        # hit up to 3 nearest
-        killed_idx=set()
-        for _,i,e in in_range[:3]:
-            cx,cy=self._cell_center(e.r,e.c)
-            self._emit(cx,cy,RED,22,150)
-            self.score+=150
-            self.director.report_kill(1)
-            if random.random()<0.65: self.coins.append((e.r,e.c))
-            killed_idx.add(i)
-        self.enemies=[e for i,e in enumerate(self.enemies) if i not in killed_idx]
-        self.snd.play("attack_hit")
+        self.clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        self.orb   = cv2.ORB_create(nfeatures=400)
+        self.bf    = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self._glut = self._build_lut(BOOST_GAMMA)
 
-    def _update_enemies(self,dt):
-        diff=self.director.difficulty if self.adaptive_on else 1.0
-        for e in self.enemies:
-            e.update_visual(dt)
-            e.decide_state(self.player,diff)
-            e.step(self.grid,self.player,self.exit,dt,diff)
-        if self.invuln_timer<=0:
-            for e in self.enemies:
-                if e.r==self.player[0] and e.c==self.player[1]:
-                    if self.mode=="maze":
-                        self.snd.play("damage"); self.screen_state="gameover"
-                    else: self._take_damage()
-                    break
+    @staticmethod
+    def _build_lut(g):
+        return np.array([((i/255.0)**(1.0/g))*255 for i in range(256)], dtype=np.uint8)
 
-    def _finish_maze(self):
-        eff=min(self.opt_len/max(1,self.path_len),1.0)
-        s=max(0,1400-self.elapsed_s*10-self.wrong*5+int(eff*350))
-        self.score+=s
-        self.stats.history.append(LevelResult("maze",self.level,self.elapsed_s,self.wrong,eff,s))
-        _rollup(self.stats); save_stats(self.stats)
-        self.profile=compute_profile(self.stats)
-        self.level+=1
-        if self.level>7: self.screen_state="win"
-        else: self.init_maze(self.level)
+    def boost(self, gray):
+        try:
+            return cv2.LUT(gray, self._glut) if gray.mean() < LOW_LIGHT_THRESH else gray
+        except Exception:
+            return gray
 
-    # ── DRAW GRID ────────────────────────────────
-    def draw_grid(self):
-        ox,oy=self.grid_origin; cell=self.cell
-        t=pygame.time.get_ticks()/1000.0
-        is_night=(self.mode=="nightout")
+    @staticmethod
+    def brightness(gray):
+        try:    return float(gray.mean())
+        except: return 255.0
 
-        for r in range(self.rows):
-            for c in range(self.cols):
-                vis=self._in_spotlight(r,c) if is_night else self._in_fog(r,c)  # survival has no fog
-                x=ox+c*cell; y=oy+r*cell
-                rect=pygame.Rect(x,y,cell,cell)
-                if not vis:
-                    pygame.draw.rect(self.screen,FOG_C,rect); continue
-                if self.grid[r][c]==1:
-                    wc=blend(WALL_C,(30,20,8),0.3) if is_night else WALL_C
-                    pygame.draw.rect(self.screen,wc,rect)
-                    pygame.draw.line(self.screen,WALL_LIT,(x,y),(x+cell-1,y))
-                    pygame.draw.line(self.screen,WALL_LIT,(x,y),(x,y+cell-1))
-                else:
-                    fc=FLOOR_C
-                    if self.heatmap and r<len(self.heatmap) and c<len(self.heatmap[r]):
-                        hv=self.heatmap[r][c]
-                        if hv>0:
-                            heat=min(hv/8.0,1.0)
-                            fc=blend(FLOOR_C,(30,10,50) if not is_night else (18,8,4),heat)
-                    pygame.draw.rect(self.screen,fc,rect)
+    def detect(self, gray):
+        try:
+            b = self.boost(gray)
+            f = self.cascade.detectMultiScale(b, scaleFactor=1.1, minNeighbors=5, minSize=(55,55))
+            if len(f) == 0:
+                f = self.cascade.detectMultiScale(b, scaleFactor=1.2, minNeighbors=3, minSize=(45,45))
+            return list(f) if len(f) else []
+        except Exception:
+            return []
 
-        # exit marker (maze only)
-        if self.mode=="maze":
-            er,ec=self.exit
-            if self._in_fog(er,ec):
-                x=ox+ec*cell; y=oy+er*cell; rect=pygame.Rect(x,y,cell,cell)
-                pulse=(math.sin(t*4)+1)*0.5
-                pygame.draw.rect(self.screen,blend(GREEN_DIM,GREEN,pulse),rect)
-                pygame.draw.rect(self.screen,GREEN,rect.inflate(-cell*.35,-cell*.35),border_radius=3)
+    def _crop(self, gray, rect):
+        try:
+            x,y,w,h = int(rect[0]),int(rect[1]),int(rect[2]),int(rect[3])
+            px,py = max(1,int(w*.18)), max(1,int(h*.18))
+            crop = gray[max(0,y-py):min(gray.shape[0],y+h+py),
+                        max(0,x-px):min(gray.shape[1],x+w+px)]
+            if crop.size < 100: return None
+            return self.clahe.apply(cv2.resize(crop,(self.SIZE,self.SIZE),
+                                               interpolation=cv2.INTER_LINEAR))
+        except Exception:
+            return None
 
-        # coins
-        for (cr2,cc2) in self.coins:
-            vis2=self._in_spotlight(cr2,cc2) if is_night else self._in_fog(cr2,cc2)
-            if not vis2: continue
-            cx2,cy2=self._cell_center(cr2,cc2)
-            pulse2=(math.sin(t*7+cr2*0.9)+1)*0.5
-            rad2=max(2,int(cell*0.22+pulse2*2))
-            pygame.draw.circle(self.screen,GOLD,(cx2,cy2),rad2)
-            pygame.draw.circle(self.screen,(255,230,120),(cx2,cy2),max(1,rad2-2))
+    @staticmethod
+    def _lbp(img):
+        try:
+            h,w = img.shape
+            res = np.zeros((h,w),dtype=np.uint8)
+            c   = img[1:-1,1:-1].astype(np.int16)
+            code= np.zeros_like(c,dtype=np.uint8)
+            for bit,(dy,dx) in enumerate([(-1,-1),(-1,0),(-1,1),(0,1),(1,1),(1,0),(1,-1),(0,-1)]):
+                nb = img[1+dy:h-1+dy,1+dx:w-1+dx].astype(np.int16)
+                code |= ((nb>=c).astype(np.uint8)<<bit)
+            res[1:-1,1:-1]=code
+            step=h//4; parts=[]
+            for gy in range(4):
+                for gx in range(4):
+                    hc,_=np.histogram(res[gy*step:(gy+1)*step,gx*step:(gx+1)*step].ravel(),
+                                      bins=32,range=(0,256))
+                    parts.append(hc.astype(np.float32))
+            feat=np.concatenate(parts); n=np.linalg.norm(feat)
+            return feat/(n+1e-7)
+        except Exception:
+            return np.zeros(512,dtype=np.float32)
 
-        # heart pickups
-        for (hr2,hc2) in self.hearts:
-            vis_h=self._in_spotlight(hr2,hc2) if is_night else self._in_fog(hr2,hc2)
-            if not vis_h: continue
-            hpx,hpy=self._cell_center(hr2,hc2)
-            pulse_h=(math.sin(t*5+hr2*1.3)+1)*0.5
-            r_h=max(2,int(cell*0.18+pulse_h*2))
-            hcol2=blend((200,50,80),(255,100,140),pulse_h)
-            # mini heart shape
-            pygame.draw.circle(self.screen,hcol2,(hpx-r_h//2,hpy-1),r_h//2+1)
-            pygame.draw.circle(self.screen,hcol2,(hpx+r_h//2,hpy-1),r_h//2+1)
-            pts_h=[(hpx-r_h,hpy),(hpx+r_h,hpy),(hpx,hpy+r_h+1)]
-            pygame.draw.polygon(self.screen,hcol2,pts_h)
+    @staticmethod
+    def _mhist(img):
+        try:
+            h,w=img.shape; sy,sx=h//3,w//3; parts=[]
+            for gy in range(3):
+                for gx in range(3):
+                    hc=cv2.calcHist([img[gy*sy:(gy+1)*sy,gx*sx:(gx+1)*sx]],
+                                    [0],None,[32],[0,256]).flatten()
+                    parts.append(hc/(np.linalg.norm(hc)+1e-7))
+            return np.concatenate(parts).astype(np.float32)
+        except Exception:
+            return np.zeros(288,dtype=np.float32)
 
-        # enemies
-        for e in self.enemies:
-            vis3=self._in_spotlight(e.r,e.c) if is_night else self._in_fog(e.r,e.c)
-            if not vis3: continue
-            vx=ox+e.visual_x*cell+cell//2; vy=oy+e.visual_y*cell+cell//2
-            col=e.get_draw_color(); rad=max(3,cell//3)
-            if e.kind in ("hunter","zombie"):
-                pygame.draw.circle(self.screen,col,(int(vx),int(vy)),rad)
-                pygame.draw.circle(self.screen,blend(col,(255,255,255),0.4),(int(vx),int(vy)),max(1,rad-3),2)
-                ex2=int(vx+(self.player[1]-e.c)*2); ey2=int(vy+(self.player[0]-e.r)*2)
-                pygame.draw.circle(self.screen,(255,255,255),(ex2,ey2),max(1,rad//3))
-            elif e.kind=="blocker":
-                r2=pygame.Rect(int(vx)-rad,int(vy)-rad,rad*2,rad*2)
-                pygame.draw.rect(self.screen,col,r2,border_radius=5)
-                pygame.draw.rect(self.screen,blend(col,(255,255,255),0.4),r2,2,border_radius=5)
-            elif e.kind=="sentinel":
-                pts=[(int(vx),int(vy)-rad),(int(vx)+rad,int(vy)+rad//2),(int(vx)-rad,int(vy)+rad//2)]
-                pygame.draw.polygon(self.screen,col,pts)
-                pygame.draw.polygon(self.screen,blend(col,(255,255,255),0.4),pts,2)
-            tag={"CHASE":"!","ATTACK":"!!","WANDER":"~","PATROL":"P"}.get(e.state,"")
-            if tag:
-                ts=self.f_small.render(tag,True,blend(col,(255,255,255),0.55))
-                self.screen.blit(ts,(int(vx)-ts.get_width()//2,int(vy)-rad-ts.get_height()))
+    def extract(self, gray, rect):
+        try:
+            crop=self._crop(self.boost(gray),rect)
+            if crop is None: return None
+            return {"lbp":self._lbp(crop),"mhist":self._mhist(crop),
+                    "des":self.orb.detectAndCompute(crop,None)[1]}
+        except Exception:
+            return None
 
-        # player
-        pr,pc=self.player; px,py=self._cell_center(pr,pc)
-        rp=max(3,cell//3); t2=pygame.time.get_ticks()/1000.0
-        pulse3=(math.sin(t2*5)+1)*0.5
-        if not (self.invuln_timer>0 and int(t2*12)%2==0):
-            pcol=SPOTLIGHT_COL if is_night else BLUE
-            pygame.draw.circle(self.screen,pcol,(px,py),rp)
-            pygame.draw.circle(self.screen,blend(pcol,(255,255,255),0.5),(px,py),rp,2)
-            glow_r=rp+int(pulse3*4)
-            gs=pygame.Surface((glow_r*2+6,glow_r*2+6),pygame.SRCALPHA)
-            gcol=(255,240,150,35) if is_night else (50,120,250,38)
-            pygame.draw.circle(gs,gcol,(glow_r+3,glow_r+3),glow_r)
-            self.screen.blit(gs,(px-glow_r-3,py-glow_r-3))
+    @staticmethod
+    def _cos(a,b):
+        try:
+            n=np.linalg.norm(a)*np.linalg.norm(b)
+            return float(np.dot(a,b)/(n+1e-7)) if n>0 else 0.0
+        except Exception:
+            return 0.0
 
-        # night-out spotlight overlay
-        if is_night:
-            sp=make_spotlight(self.nightout_radius,WIDTH,HEIGHT,px,py)
-            self.screen.blit(sp,(0,0))
+    def similarity(self, a, b):
+        try:
+            s = 0.45*max(0.,self._cos(a["lbp"],b["lbp"])) + \
+                0.45*max(0.,self._cos(a["mhist"],b["mhist"]))
+            da,db=a.get("des"),b.get("des")
+            if da is not None and db is not None and len(da)>4 and len(db)>4:
+                try:
+                    ms=self.bf.knnMatch(da,db,k=2)
+                    good=sum(1 for m in ms if len(m)==2 and m[0].distance<0.75*m[1].distance)
+                    s += 0.10*(good/max(len(ms),1))
+                except Exception: pass
+            return s
+        except Exception:
+            return 0.0
 
-        # particles
-        alive=[]
-        for p in self.particles:
-            if p.update(1/60): p.draw(self.screen); alive.append(p)
-        self.particles=alive
 
-    # ── HUD ──────────────────────────────────────
-    def _draw_heart(self, cx, cy, r, filled):
-        """Draw a heart icon centred at cx,cy with radius r."""
-        hcol  = RED          if filled else (50, 15, 15)
-        hcol2 = (255,140,160) if filled else (80, 25, 25)
-        # two lobes
-        pygame.draw.circle(self.screen, hcol,  (cx - r//2, cy - r//4), r//2 + 1)
-        pygame.draw.circle(self.screen, hcol,  (cx + r//2, cy - r//4), r//2 + 1)
-        # bottom triangle
-        pts = [(cx - r, cy - r//4 + 1), (cx + r, cy - r//4 + 1), (cx, cy + r)]
-        pygame.draw.polygon(self.screen, hcol, pts)
-        # highlight ring (filled hearts only)
-        if filled:
-            pygame.draw.circle(self.screen, hcol2, (cx - r//2, cy - r//4), r//2 + 1, 1)
-            pygame.draw.circle(self.screen, hcol2, (cx + r//2, cy - r//4), r//2 + 1, 1)
+# ══════════════════════════════════════════════════════════════════════════════
+#  USER DATABASE
+# ══════════════════════════════════════════════════════════════════════════════
+class UserDB:
+    def __init__(self):
+        os.makedirs(FACES_DIR, exist_ok=True)
+        self._data: Dict[str, dict] = {}
+        self._load()
 
-    def draw_hud(self):
-        # ── background panel ──────────────────────────────
-        pygame.draw.rect(self.screen, PANEL, (0, 0, WIDTH, 92))
-        pygame.draw.line(self.screen, (38, 36, 78), (0, 92), (WIDTH, 92), 2)
+    def _load(self):
+        if os.path.exists(USERS_FILE):
+            try:
+                with open(USERS_FILE, "rb") as f:
+                    self._data = pickle.load(f)
+            except Exception:
+                self._data = {}
 
-        # ── left: mode name + profile ─────────────────────
-        mode_label = MODE_NAMES.get(self.mode, "")
-        pcol = PROFILE_COLORS.get(self.profile, MUTED)
-        self.blit(mode_label,            (18, 14), self.f_med,   CYAN)
-        self.blit(f"Profile: {self.profile}", (18, 48), self.f_small, pcol)
+    def _save(self):
+        with open(USERS_FILE, "wb") as f:
+            pickle.dump(self._data, f)
 
-        if self.mode == "maze":
-            # ── MAZE HUD layout ───────────────────────────
-            # SCORE | TIME | LVL | WRONG | EFF | AI
-            items = [
-                (220, f"SCORE  {self.score}",           CYAN),
-                (420, f"TIME  {self.elapsed_s}s",       YELLOW),
-                (580, f"LVL  {self.level}/7",           PURPLE),
-                (700, f"WRONG  {self.wrong}",           RED),
-            ]
-            for xpos, txt, col in items:
-                self.blit(txt, (xpos, 30), self.f_med, col)
-            eff = min(self.opt_len / max(1, self.path_len), 1.0)
-            self.blit(f"EFF  {int(eff*100)}%", (900, 30), self.f_med,
-                      GREEN if eff > 0.6 else YELLOW)
+    def names(self) -> List[str]:
+        return [v["display"] for v in self._data.values()]
 
-        else:
-            # ── SURVIVAL / NIGHTOUT HUD ───────────────────
-            # Row 1: hearts  coin-icon count  |  SCORE  TIME  WAVE  DIFF  [label]
-            # Row 2: ENEMIES  AI indicator  diff-graph
+    def keys(self) -> List[str]:
+        return list(self._data.keys())
 
-            # Hearts (row 1, left area, starting x=200)
-            heart_start_x = 210
-            heart_r = 9
-            for i in range(self.max_hp):
-                hcx = heart_start_x + i * (heart_r * 2 + 6) + heart_r
-                self._draw_heart(hcx, 32, heart_r, i < self.hp)
+    def has(self, name: str) -> bool:
+        return name.strip().lower() in self._data
 
-            # Coin icon + count
-            cx_icon = heart_start_x + self.max_hp * (heart_r * 2 + 6) + 14
-            pygame.draw.circle(self.screen, GOLD,         (cx_icon + 9, 32), 9)
-            pygame.draw.circle(self.screen, (200, 155, 20), (cx_icon + 9, 32), 9, 2)
-            cc_s = self.f_med.render(f" {len(self.coins)}", True, GOLD)
-            self.screen.blit(cc_s, (cx_icon + 22, 22))
+    def add(self, name: str, features: list):
+        self._data[name.strip().lower()] = {
+            "display": name.strip(), "features": features
+        }
+        self._save()
 
-            # Right-side stats — spread evenly from x=500 to x=1100
-            diff = self.director.difficulty if self.adaptive_on else 1.0
-            el   = self.director.ease_label
-            el_col = (GREEN if "EASY" in el else
-                      ORANGE if ("EASE" in el or "BAL" in el) else RED)
-            right_items = [
-                (500,  f"SCORE  {self.score}",    CYAN),
-                (680,  f"TIME  {self.elapsed_s}s", YELLOW),
-                (820,  f"WAVE  {self.wave}",       ORANGE),
-                (960,  f"DIFF  {diff:.2f}",
-                       RED if diff > 1.3 else (ORANGE if diff > 1.0 else GREEN)),
-                (1080, f"{el}",                    el_col),
-            ]
-            for xpos, txt, col in right_items:
-                self.blit(txt, (xpos, 16), self.f_med if xpos < 1080 else self.f_small, col)
+    def delete(self, key: str):
+        self._data.pop(key, None)
+        self._save()
 
-            # Row 2: enemies count  +  AI toggle  +  diff graph
-            self.blit(f"ENEMIES  {len(self.enemies)}", (500, 54), self.f_small, MUTED)
+    def display(self, key: str) -> str:
+        return self._data.get(key, {}).get("display", key)
 
-        # ── AI indicator (always top-right) ───────────────
-        ai_c = GREEN if self.adaptive_on else RED
-        self.blit(f"AI:{'ON' if self.adaptive_on else 'OFF'}", (WIDTH - 70, 16), self.f_small, ai_c)
+    def all_features(self):
+        for v in self._data.values():
+            yield v["display"], v["features"]
 
-        # ── diff graph (survival/nightout only, top-right) ─
-        hist = self.director.diff_history
-        if len(hist) > 1 and self.mode != "maze":
-            gx, gy, gw, gh = WIDTH - 68, 36, 56, 44
-            pygame.draw.rect(self.screen, (4, 4, 10), (gx, gy, gw, gh))
-            sampled = hist[-(gw):]
-            n = len(sampled)
-            pts = [(gx + int(i / max(1, n - 1) * (gw - 1)),
-                    gy + gh - int((v - 0.4) / 1.2 * gh))
-                   for i, v in enumerate(sampled)]
-            if len(pts) > 1:
-                pygame.draw.lines(self.screen, CYAN, False, pts, 1)
+    def count(self) -> int:
+        return len(self._data)
 
-    # ── DRAW MENU ────────────────────────────────
-    def draw_menu(self,events):
-        self.screen.fill(BG)
-        t=pygame.time.get_ticks()/1000.0
 
-        # star-field
-        rng=random.Random(42)
-        for _ in range(130):
-            sx=rng.randint(0,WIDTH); sy=rng.randint(0,HEIGHT)
-            br=int((math.sin(t*rng.uniform(0.4,1.8)+rng.uniform(0,6))+1)*0.5*180)+40
-            pygame.draw.circle(self.screen,(br,br,min(br+30,255)),(sx,sy),rng.randint(1,2))
+# ══════════════════════════════════════════════════════════════════════════════
+#  CAMERA THREAD
+# ══════════════════════════════════════════════════════════════════════════════
+class CamThread(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.frame = None
+        self.gray  = None
+        self.ok    = False
+        self._stop = threading.Event()
 
-        # title with drop shadow
-        glow=(math.sin(t*1.8)+1)*0.5
-        title_col=blend(CYAN,PURPLE,glow)
-        shadow=self.f_title.render("AI  MAZE  GAME",True,(0,0,0))
-        self.screen.blit(shadow,(WIDTH//2-shadow.get_width()//2+3,78))
-        self.blit_c("AI  MAZE  GAME",WIDTH//2,75,self.f_title,title_col)
-
-        self.blit_c("A* Pathfinding  ·  Adaptive AI Director  ·  FSM Enemies  ·  Player Profiling",
-                    WIDTH//2,148,self.f_small,MUTED)
-
-        # decorative divider line
-        lx=WIDTH//2; ly=172
-        pygame.draw.line(self.screen,blend(PURPLE,BG,0.5),(lx-260,ly),(lx+260,ly),1)
-
-        # profile badge
-        prof=self.profile; pcol=PROFILE_COLORS.get(prof,MUTED)
-        bs=self.f_med.render(f"   {prof}   ",True,pcol)
-        bx=WIDTH//2-bs.get_width()//2; by=182
-        pygame.draw.rect(self.screen,blend(pcol,(0,0,0),0.88),(bx-7,by-5,bs.get_width()+14,bs.get_height()+10),border_radius=10)
-        pygame.draw.rect(self.screen,pcol,(bx-7,by-5,bs.get_width()+14,bs.get_height()+10),1,border_radius=10)
-        self.screen.blit(bs,(bx,by))
-
-        for i,b in enumerate(self.menu_btns):
-            if i==2: b.text=f"ADAPTIVE AI:  {'ON ' if self.adaptive_on else 'OFF'}"
-            if i==3: b.text=f"SOUND:  {'ON ' if self.sound_on else 'OFF'}"
-            b.draw(self.screen,self.f_med)
-
-        if self.menu_btns[0].handle(events): self.snd.play("menu_click"); self.select_mode=None; self.screen_state="select_level"
-        if self.menu_btns[1].handle(events): self.snd.play("menu_click"); self.screen_state="stats"
-        if self.menu_btns[2].handle(events): self.snd.play("menu_click"); self.adaptive_on=not self.adaptive_on
-        if self.menu_btns[3].handle(events): self.snd.play("menu_click"); self.sound_on=not self.sound_on; self.snd.enabled=self.sound_on
-        if self.menu_btns[4].handle(events): self.running=False
-
-        self.snd.play_music("menu")
-
-        pygame.display.flip()
-
-    # ── SELECT LEVEL ─────────────────────────────
-    def draw_select_level(self,events):
-        self.screen.fill(BG)
-        cx=WIDTH//2; w,h,gap=500,76,18; top=215
-
-        if self.select_mode is None:
-            self.blit_c("SELECT LEVEL",cx,78,self.f_big,CYAN)
-            self.blit_c("Choose a game mode:",cx,145,self.f_med,MUTED)
-            modes=[
-                ("LOST IN A MAZE","maze",    PURPLE, "7 levels  ·  procedural maze  ·  many paths to explore"),
-                ("SURVIVAL",      "survival",RED,    "Zombie waves  ·  collect coins  ·  adaptive difficulty"),
-                ("NIGHT OUT",     "nightout",(180,120,255),"Pitch dark  ·  spotlight only  ·  find coins in the dark"),
-            ]
-            for i,(label,key,col,desc) in enumerate(modes):
-                rect=pygame.Rect(cx-w//2,top+i*(h+gap),w,h)
-                hov=rect.collidepoint(pygame.mouse.get_pos())
-                pygame.draw.rect(self.screen,blend(col,(0,0,0),0.50 if hov else 0.77),rect,border_radius=14)
-                pygame.draw.rect(self.screen,col,rect,2,border_radius=14)
-                self.blit_c(label,cx,rect.y+10,self.f_med,TEXT)
-                self.blit_c(desc, cx,rect.y+44,self.f_small,blend(col,(215,215,215),0.4))
-                for e in events:
-                    if e.type==pygame.MOUSEBUTTONDOWN and e.button==1 and rect.collidepoint(e.pos):
-                        self.select_mode=key
-            back_y=top+3*(h+gap)+16
-            back=Button((cx-115,back_y,230,52),"BACK")
-            back.draw(self.screen,self.f_med)
-            if back.handle(events): self.screen_state="menu"; self.build_menu()
-
-        else:
-            titles={"maze":("LOST IN A MAZE",PURPLE),"survival":("SURVIVAL",RED),"nightout":("NIGHT OUT",(180,120,255))}
-            title,tcol=titles[self.select_mode]
-            self.blit_c(title,cx,78,self.f_big,tcol)
-            self.blit_c("Select difficulty / starting level:",cx,145,self.f_med,MUTED)
-
-            if self.select_mode=="maze":
-                opts=[
-                    ("LEVEL 1  —  Easy",   1,GREEN,  "Larger maze · extra corridors · no enemies"),
-                    ("LEVEL 3  —  Medium", 3,CYAN,   "Big maze · many paths · one hunter"),
-                    ("LEVEL 5  —  Hard",   5,ORANGE, "Huge maze · fog of war · two enemies"),
-                ]
-                for i,(label,lvl,col,desc) in enumerate(opts):
-                    rect=pygame.Rect(cx-w//2,top+i*(h+gap),w,h)
-                    hov=rect.collidepoint(pygame.mouse.get_pos())
-                    pygame.draw.rect(self.screen,blend(col,(0,0,0),0.50 if hov else 0.77),rect,border_radius=14)
-                    pygame.draw.rect(self.screen,col,rect,2,border_radius=14)
-                    self.blit_c(label,cx,rect.y+10,self.f_med,TEXT)
-                    self.blit_c(desc, cx,rect.y+44,self.f_small,blend(col,(215,215,215),0.4))
-                    for e in events:
-                        if e.type==pygame.MOUSEBUTTONDOWN and e.button==1 and rect.collidepoint(e.pos):
-                            self.profile=compute_profile(self.stats)
-                            self.init_maze(lvl); self.screen_state="play"; self.select_mode=None
-            else:
-                opts=[
-                    ("EASY",  "Easy",  GREEN,  "0.7× spawn rate  ·  forgiving  ·  good for learning"),
-                    ("MEDIUM","Medium",ORANGE, "1.0× spawn rate  ·  balanced  ·  recommended"),
-                    ("HARD",  "Hard",  RED,    "1.4× spawn rate  ·  relentless  ·  true challenge"),
-                ]
-                for i,(label,key,col,desc) in enumerate(opts):
-                    rect=pygame.Rect(cx-w//2,top+i*(h+gap),w,h)
-                    hov=rect.collidepoint(pygame.mouse.get_pos())
-                    sel=self.apoc_difficulty==key
-                    bg2=blend(col,(0,0,0),0.40 if sel else (0.50 if hov else 0.77))
-                    pygame.draw.rect(self.screen,bg2,rect,border_radius=14)
-                    pygame.draw.rect(self.screen,col,rect,3 if sel else 2,border_radius=14)
-                    self.blit_c(label,cx,rect.y+10,self.f_med,TEXT)
-                    self.blit_c(desc, cx,rect.y+44,self.f_small,blend(col,(215,215,215),0.4))
-                    for e in events:
-                        if e.type==pygame.MOUSEBUTTONDOWN and e.button==1 and rect.collidepoint(e.pos):
-                            self.apoc_difficulty=key
-                            if self.select_mode=="survival": self.init_survival()
-                            else: self.init_nightout()
-                            self.screen_state="play"; self.select_mode=None
-            back_y=top+3*(h+gap)+16
-            back=Button((cx-115,back_y,230,52),"BACK")
-            back.draw(self.screen,self.f_med)
-            if back.handle(events): self.select_mode=None
-
-        pygame.display.flip()
-
-    # ── STATS ────────────────────────────────────
-    def draw_stats(self,events):
-        self.screen.fill(BG)
-        self.blit("PLAYER STATS",(40,28),self.f_big,PURPLE)
-        prof=compute_profile(self.stats); pcol=PROFILE_COLORS.get(prof,MUTED)
-        self.blit(f"Profile: {prof}",(40,96),self.f_med,pcol)
-        for i,(lbl,val) in enumerate([
-            ("Avg Time",f"{self.stats.avg_time:.1f}s"),
-            ("Avg Wrong Moves",f"{self.stats.avg_wrong:.1f}"),
-            ("Avg Efficiency",f"{int(self.stats.avg_eff*100)}%"),
-            ("Total Runs",str(self.stats.levels)),
-        ]):
-            self.blit(f"{lbl}:  {val}",(40,132+i*24),self.f_ui,MUTED)
-        descs={"Beginner":"Still learning. Mazes will be gentle.",
-               "Balanced":"Well-rounded. Steady challenge ahead.",
-               "SpeedRunner":"Fast & efficient! Bigger mazes incoming.",
-               "LogicalPlanner":"Minimal wrong turns. Fog & interceptors ahead.",
-               "Explorer":"You roam freely. Larger maps await."}
-        self.blit(f'"{descs.get(prof,"")}"',(40,238),self.f_small,blend(pcol,(200,200,200),0.5))
-        y=272
-        for xh,hd in zip([40,215,310,425,535,650],["MODE","LVL","TIME","WRONG","EFF","SCORE"]):
-            self.blit(hd,(xh,y),self.f_ui,MUTED)
-        pygame.draw.line(self.screen,MUTED,(40,y+22),(770,y+22),1); y+=28
-        for h in self.stats.history[-10:]:
-            self.blit(MODE_NAMES.get(h.mode,h.mode),(40,y),self.f_small,TEXT)
-            self.blit(str(h.level),(215,y),self.f_small,PURPLE)
-            self.blit(f"{h.time_s}s",(310,y),self.f_small,YELLOW)
-            self.blit(str(h.wrong),(425,y),self.f_small,RED if h.wrong>10 else TEXT)
-            ec=GREEN if h.efficiency>0.7 else (YELLOW if h.efficiency>0.4 else RED)
-            self.blit(f"{int(h.efficiency*100)}%",(535,y),self.f_small,ec)
-            self.blit(str(h.score),(650,y),self.f_small,CYAN)
-            y+=22
-        clr=Button((840,272,170,36),"CLEAR",color=(80,20,20))
-        clr.draw(self.screen,self.f_small)
-        if clr.handle(events): self.stats=StatsData(); save_stats(self.stats); self.profile="Beginner"
-        back=Button((40,HEIGHT-72,200,52),"BACK")
-        back.draw(self.screen,self.f_med)
-        if back.handle(events): self.screen_state="menu"; self.build_menu()
-        pygame.display.flip()
-
-    # ── GAME OVER ────────────────────────────────
-    def draw_gameover(self,events,title="GAME OVER",color=RED):
-        self.screen.fill(BG)
-        self.blit_c(title,WIDTH//2,158,self.f_big,color)
-        self.blit_c(f"Score:  {self.score}",WIDTH//2,228,self.f_med,CYAN)
-        if self.mode!="maze":
-            self.blit_c(f"Survived  {self.elapsed_s}s   ·   Wave {self.wave}",WIDTH//2,265,self.f_ui,MUTED)
-        retry=Button((WIDTH//2-205,325,410,58),"RETRY",primary=True)
-        menu =Button((WIDTH//2-205,398,410,58),"MAIN MENU")
-        retry.draw(self.screen,self.f_med); menu.draw(self.screen,self.f_med)
-        if retry.handle(events):
-            if   self.mode=="maze":     self.init_maze(1)
-            elif self.mode=="survival": self.init_survival()
-            else:                       self.init_nightout()
-            self.screen_state="play"
-        if menu.handle(events): self.screen_state="menu"; self.build_menu()
-        pygame.display.flip()
-
-    def draw_pause_hint(self):
-        hints="ESC = menu   ·   WASD / Arrows = move"
-        if self.mode in ("nightout","survival"): hints+="   ·   SPACE = attack  (range 7, hits up to 3)"
-        self.blit(hints,(30,HEIGHT-28),self.f_small,MUTED)
-
-    # ── MAIN LOOP ────────────────────────────────
     def run(self):
-        while self.running:
-            dt=self.clock.tick(FPS)/1000.0
-            events=pygame.event.get()
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            return
+        self.ok = True
+        while not self._stop.is_set():
+            ret, frame = cap.read()
+            if ret:
+                self.frame = frame
+                self.gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            time.sleep(0.033)
+        cap.release()
+
+    def stop(self):
+        self._stop.set()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UI WIDGETS
+# ══════════════════════════════════════════════════════════════════════════════
+class Btn:
+    def __init__(self, rect, label, primary=False, danger=False):
+        self.r       = pygame.Rect(rect)
+        self.label   = label
+        self.primary = primary
+        self.danger  = danger
+        self._a      = 0.0
+        self.hover   = False
+
+    def draw(self, surf, font):
+        if self.danger:
+            bg, hi, bo = (55,8,8), (120,20,20), (200,35,35)
+        elif self.primary:
+            bg, hi, bo = (50,10,130), (90,30,200), PURPLE
+        else:
+            bg, hi, bo = (16,15,38), (28,25,65), (42,40,82)
+        self._a += 0.20 * ((1.0 if self.hover else 0.0) - self._a)
+        pygame.draw.rect(surf, _blend(bg, hi, self._a), self.r, border_radius=10)
+        pygame.draw.rect(surf, bo, self.r, 2, border_radius=10)
+        lbl = font.render(self.label, True, TEXT)
+        surf.blit(lbl, lbl.get_rect(center=self.r.center))
+
+    def hit(self, events) -> bool:
+        self.hover = self.r.collidepoint(pygame.mouse.get_pos())
+        return any(
+            e.type == pygame.MOUSEBUTTONDOWN and e.button == 1 and self.hover
+            for e in events
+        )
+
+
+class TextBox:
+    def __init__(self, rect, placeholder=""):
+        self.r    = pygame.Rect(rect)
+        self.text = ""
+        self.ph   = placeholder
+        self.active = False
+        self._t   = 0.0
+
+    def handle(self, events, dt):
+        self._t += dt
+        for e in events:
+            if e.type == pygame.MOUSEBUTTONDOWN:
+                self.active = self.r.collidepoint(e.pos)
+            if e.type == pygame.KEYDOWN and self.active:
+                if e.key == pygame.K_BACKSPACE:
+                    self.text = self.text[:-1]
+                elif e.key in (pygame.K_RETURN, pygame.K_ESCAPE):
+                    self.active = False
+                elif e.unicode.isprintable() and len(self.text) < 22:
+                    self.text += e.unicode
+
+    def draw(self, surf, font):
+        bo = PURPLE if self.active else MUTED
+        pygame.draw.rect(surf, (18,16,42), self.r, border_radius=8)
+        pygame.draw.rect(surf, bo, self.r, 2, border_radius=8)
+        display = self.text if self.text else self.ph
+        col     = TEXT if self.text else MUTED
+        lbl = font.render(display, True, col)
+        surf.blit(lbl, (self.r.x+12, self.r.centery - lbl.get_height()//2))
+        if self.active and int(self._t*2) % 2 == 0:
+            cx = self.r.x + 12 + (lbl.get_width() if self.text else 0) + 2
+            pygame.draw.line(surf, TEXT,
+                             (cx, self.r.centery-10), (cx, self.r.centery+10), 2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FACE AUTH SYSTEM  (public API)
+# ══════════════════════════════════════════════════════════════════════════════
+class FaceAuthSystem:
+    def __init__(self):
+        self.engine = FaceEngine()
+        self.db     = UserDB()
+        self._cam: Optional[CamThread] = None
+
+    # ── camera ────────────────────────────────────────────────────────────────
+    def _start_cam(self):
+        if self._cam is None or not self._cam.is_alive():
+            self._cam = CamThread()
+            self._cam.start()
+            time.sleep(0.5)
+
+    def shutdown(self):
+        if self._cam:
+            self._cam.stop()
+            self._cam = None
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _cam_surface(self, w, h) -> Tuple[Optional[pygame.Surface], list]:
+        if not self._cam or not self._cam.ok or self._cam.frame is None:
+            return None, []
+        frame = cv2.resize(self._cam.frame.copy(), (w, h))
+        gray  = cv2.resize(self._cam.gray, (w, h))
+        rects = self.engine.detect(gray)
+        for (x, y, fw, fh) in rects:
+            cv2.rectangle(frame, (x,y), (x+fw, y+fh), (130,55,240), 2)
+        self._last_gray       = gray
+        self._last_brightness = self.engine.brightness(gray)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return pygame.surfarray.make_surface(rgb.swapaxes(0,1)), rects
+
+    def _identify(self, rect) -> Tuple[Optional[str], float]:
+        try:
+            gray = getattr(self, '_last_gray', None)
+            if gray is None: return None, 0.0
+            feat = self.engine.extract(gray, rect)
+            if feat is None: return None, 0.0
+            best_name, best_sim = None, 0.0
+            for dname, features in self.db.all_features():
+                sims = sorted((self.engine.similarity(feat,f) for f in features),reverse=True)
+                top  = sims[:max(1,len(sims)//2)]
+                avg  = sum(top)/len(top)
+                if avg > best_sim: best_sim, best_name = avg, dname
+            return best_name, best_sim
+        except Exception:
+            return None, 0.0
+
+    def _header(self, surf, W, t, title, f_big, f_sm):
+        pulse = _blend(PURPLE, BLUE, 0.5 + 0.5*math.sin(t*1.8))
+        pygame.draw.rect(surf, pulse, (0, 0, W, 5))
+        tl = f_big.render(title, True, TEXT)
+        surf.blit(tl, tl.get_rect(centerx=W//2, y=18))
+        sl = f_sm.render("AI Maze  ·  Facial Recognition", True, MUTED)
+        surf.blit(sl, sl.get_rect(centerx=W//2, y=68))
+        pygame.draw.line(surf, _blend(PURPLE, BG, 0.55),
+                         (W//2-280, 96), (W//2+280, 96), 1)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  PUBLIC ENTRY POINT
+    # ══════════════════════════════════════════════════════════════════════════
+    def run(self, screen: pygame.Surface, clock: pygame.time.Clock) -> Optional[str]:
+        self._start_cam()
+        return self._hub(screen, clock)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  HUB
+    # ─────────────────────────────────────────────────────────────────────────
+    def _hub(self, screen, clock) -> Optional[str]:
+        W, H  = screen.get_size()
+        f_big = _font(38, bold=True)
+        f_med = _font(21, bold=True)
+        f_ui  = _font(16)
+        f_sm  = _font(13)
+
+        CAM_W, CAM_H = 350, 262
+        cam_x = W//2 - CAM_W//2
+        cam_y = 116
+
+        BW, BX = 320, W//2 - 160
+        btn_login  = Btn((BX, cam_y+CAM_H+30,  BW, 52), "FACE LOGIN",        primary=True)
+        btn_reg    = Btn((BX, cam_y+CAM_H+96,  BW, 52), "REGISTER NEW FACE")
+        btn_manage = Btn((BX, cam_y+CAM_H+162, BW, 52), "MANAGE USERS")
+        btn_guest  = Btn((BX, cam_y+CAM_H+232, BW, 46), "PLAY AS GUEST")
+
+        t = 0.0
+        msg, mc, mt = "", GREEN, 0.0
+
+        while True:
+            dt = clock.tick(60) / 1000.0
+            t += dt
+            mt = max(0.0, mt - dt)
+            events = pygame.event.get()
             for e in events:
-                if e.type==pygame.QUIT: self.running=False
-                if e.type==pygame.KEYDOWN:
-                    if e.key==pygame.K_ESCAPE and self.screen_state in ("play","select_level"):
-                        self.screen_state="menu"; self.build_menu()
-                    if e.key==pygame.K_SPACE and self.screen_state=="play" \
-                       and self.mode in ("nightout","survival"):
-                        self._player_attack()
+                if e.type == pygame.QUIT:
+                    pygame.quit(); raise SystemExit
 
-            if self.screen_state=="menu":
-                self.draw_menu(events); continue
-            if self.screen_state=="stats":
-                self.draw_stats(events); continue
-            if self.screen_state=="select_level":
-                self.draw_select_level(events); continue
-            if self.screen_state=="gameover":
-                self.draw_gameover(events); continue
-            if self.screen_state=="win":
-                self.draw_gameover(events,"YOU ESCAPED!  7/7",GREEN); continue
+            cam_surf, rects = self._cam_surface(CAM_W, CAM_H)
 
-            # ═══ PLAY ════════════════════════════
-            self.screen.fill(BG)
-            self.draw_hud()
-            self.elapsed_s=(pygame.time.get_ticks()-self.start_ticks)//1000
-            self.invuln_timer=max(0.0,self.invuln_timer-dt)
-            self._mv_cd=max(0.0,self._mv_cd-dt)
+            screen.fill(BG)
+            self._header(screen, W, t, "FACE RECOGNITION LOGIN", f_big, f_sm)
 
-            keys=pygame.key.get_pressed()
-            if self._mv_cd<=0:
-                moved=False
-                if   keys[pygame.K_UP]    or keys[pygame.K_w]: self._try_move(-1,0); moved=True
-                elif keys[pygame.K_DOWN]  or keys[pygame.K_s]: self._try_move(1,0);  moved=True
-                elif keys[pygame.K_LEFT]  or keys[pygame.K_a]: self._try_move(0,-1); moved=True
-                elif keys[pygame.K_RIGHT] or keys[pygame.K_d]: self._try_move(0,1);  moved=True
-                if moved: self._mv_cd=self._mv_rate; self.snd.play("move")
-
-            self.director.tick(dt); self._dir_t+=dt
-            if self._dir_t>=2.5:
-                self._dir_t=0.0
-                if self.adaptive_on: self.director.update_every()
-
-            if self.mode=="maze":
-                self._update_enemies(dt)
+            # camera panel
+            cam_rect = pygame.Rect(cam_x, cam_y, CAM_W, CAM_H)
+            pygame.draw.rect(screen, PANEL, cam_rect.inflate(6,6), border_radius=12)
+            if cam_surf:
+                screen.blit(cam_surf, (cam_x, cam_y))
             else:
-                diff=self.director.difficulty if self.adaptive_on else 1.0
-                self.spawn_timer+=dt
-                si={"survival":2.8,"nightout":3.0}.get(self.mode,2.8)  # was 1.8/2.2
-                cap={"survival":20,"nightout":16}.get(self.mode,18)
-                if self.spawn_timer>=max(0.3,si/diff):
-                    self.spawn_timer=0.0
-                    if len(self.enemies)<cap:
-                        kind="zombie" if self.mode=="survival" else random.choice(["zombie","sentinel"])
-                        self._spawn_survival(kind)
-                self.wave_timer+=dt
-                wd={"survival":20.0,"nightout":18.0}.get(self.mode,20.0)
-                if self.wave_timer>=wd:
-                    self.wave_timer=0.0; self.wave+=1; self.score+=200
-                    self.wave_alert_shown=True   # triggers banner
-                    self.snd.play("wave_clear")
-                    if self.mode=="survival" and self.wave%3==0:
-                        self.hp=min(self.hp+1,self.max_hp)
-                        self.snd.play("powerup")
-                    if self.adaptive_on:
-                        self.director.report_kill(2)
-                        self.director.report_wave_cleared()
-                    self._scatter_coins(3)
-                    if self.mode=="survival": self._scatter_hearts(3)  # bonus hearts each wave (survival)
-                    else: self._scatter_hearts(1)
-                self._update_enemies(dt)
+                pygame.draw.rect(screen, (18,16,40), cam_rect, border_radius=8)
+                nl = f_ui.render("Camera unavailable", True, MUTED)
+                screen.blit(nl, nl.get_rect(center=cam_rect.center))
+            pygame.draw.rect(screen, PURPLE, cam_rect, 2, border_radius=8)
 
-            self.draw_grid()
-            self.draw_pause_hint()
-            # ── wave alert banner ────────────────
-            if getattr(self,'wave_alert_shown',False):
-                if not hasattr(self,'_wave_banner_t'): self._wave_banner_t=0.0
-                self._wave_banner_t+=dt
-                alpha=clamp(1.0-self._wave_banner_t*1.4,0,1)
-                if alpha>0:
-                    msg=f"  WAVE {self.wave}  "
-                    bs=self.f_big.render(msg,True,ORANGE)
-                    bx=WIDTH//2-bs.get_width()//2; by=HEIGHT//2-40
-                    surf=pygame.Surface((bs.get_width()+20,bs.get_height()+14),pygame.SRCALPHA)
-                    surf.fill((20,8,0,int(180*alpha)))
-                    self.screen.blit(surf,(bx-10,by-7))
-                    col2=blend(ORANGE,TEXT,1-alpha)
-                    self.blit_c(msg,WIDTH//2,by,self.f_big,col2)
-                else:
-                    self.wave_alert_shown=False; self._wave_banner_t=0.0
+            dot_col = GREEN if rects else MUTED
+            dot_txt = f"  {len(rects)} face detected" if rects else "  No face detected"
+            screen.blit(f_sm.render(dot_txt, True, dot_col), (cam_x+6, cam_y+CAM_H+6))
+            uc = f_sm.render(f"Registered: {self.db.count()}", True, MUTED)
+            screen.blit(uc, (cam_x+CAM_W-uc.get_width()-4, cam_y+CAM_H+6))
+
+            for btn in (btn_login, btn_reg, btn_manage, btn_guest):
+                btn.draw(screen, f_med)
+
+            if msg and mt > 0:
+                ml = f_ui.render(msg, True, _blend(BG, mc, min(1.0, mt/0.5)))
+                screen.blit(ml, ml.get_rect(centerx=W//2, y=H-46))
+
             pygame.display.flip()
 
-        pygame.quit()
+            if btn_login.hit(events):
+                result = self._login(screen, clock)
+                if result:
+                    return result
+                msg, mc, mt = "Face not recognised — try again or register.", RED, 3.5
 
-# ═══════════════════════════════════════════════════
-if __name__=="__main__":
-    Game().run()
+            if btn_reg.hit(events):
+                result = self._register(screen, clock)
+                if result:
+                    msg, mc, mt = f"Registered '{result}'!  You can now face-login.", GREEN, 4.0
+
+            if btn_manage.hit(events):
+                self._manage(screen, clock)
+
+            if btn_guest.hit(events):
+                return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  FACE LOGIN
+    # ─────────────────────────────────────────────────────────────────────────
+    def _login(self, screen, clock) -> Optional[str]:
+        W, H  = screen.get_size()
+        f_big = _font(34, bold=True)
+        f_med = _font(20, bold=True)
+        f_ui  = _font(16)
+        f_sm  = _font(13)
+
+        CAM_W, CAM_H = 400, 300
+        cam_x = W//2 - CAM_W//2
+        cam_y = 112
+
+        btn_back = Btn((W//2-160, cam_y+CAM_H+170, 320, 50), "BACK")
+
+        progress   = 0.0
+        FILL_RATE  = 0.85   # fills in ~1.2 s of consistent match
+        hit_name   = None
+        locked     = False
+        lock_timer = 0.0
+        t          = 0.0
+        msg, mc    = "Position your face — hold still", CYAN
+        torch_on   = False
+
+        while True:
+            dt = clock.tick(60) / 1000.0
+            t += dt
+            events = pygame.event.get()
+            for e in events:
+                if e.type == pygame.QUIT:
+                    pygame.quit(); raise SystemExit
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                    return None
+
+            cam_surf, rects = self._cam_surface(CAM_W, CAM_H)
+
+            if not locked:
+                if rects and getattr(self, '_last_gray', None) is not None:
+                    name, sim = self._identify(rects[0])
+                    if sim >= MATCH_THRESHOLD and name:
+                        progress = min(1.0, progress + FILL_RATE * dt)
+                        msg, mc  = f"Scanning…  {int(progress*100)}%", CYAN
+                        hit_name = name
+                    else:
+                        progress = max(0.0, progress - FILL_RATE * dt)
+                        msg, mc  = "No match yet — keep looking at camera", YELLOW
+                else:
+                    progress = max(0.0, progress - FILL_RATE * 0.6 * dt)
+                    msg, mc  = "No face detected", MUTED
+
+                if progress >= 1.0 and hit_name:
+                    locked, lock_timer = True, 1.6
+                    msg, mc = f"Welcome back, {hit_name}!", GREEN
+            else:
+                lock_timer -= dt
+                if lock_timer <= 0:
+                    return hit_name
+
+            # draw
+            if torch_on:
+                screen.fill(TORCH)
+            else:
+                screen.fill(BG)
+                self._header(screen, W, t, "FACE LOGIN", f_big, f_sm)
+
+            cam_rect = pygame.Rect(cam_x, cam_y, CAM_W, CAM_H)
+            if not torch_on:
+                pygame.draw.rect(screen, PANEL, cam_rect.inflate(6,6), border_radius=12)
+            if cam_surf:
+                screen.blit(cam_surf, (cam_x, cam_y))
+            else:
+                pygame.draw.rect(screen, (18,16,40), cam_rect, border_radius=8)
+            bo = GREEN if locked else (CYAN if progress > 0.05 else PURPLE)
+            pygame.draw.rect(screen, bo, cam_rect, 2, border_radius=8)
+
+            if not torch_on:
+                bar = pygame.Rect(cam_x, cam_y+CAM_H+14, CAM_W, 13)
+                pygame.draw.rect(screen, DARK_PU, bar, border_radius=6)
+                fw = int(CAM_W * progress)
+                if fw > 0:
+                    fc = GREEN if locked else _blend(BLUE, GREEN, progress)
+                    pygame.draw.rect(screen, fc,
+                                     pygame.Rect(cam_x, cam_y+CAM_H+14, fw, 13),
+                                     border_radius=6)
+                pygame.draw.rect(screen, MUTED, bar, 1, border_radius=6)
+
+                ml = f_ui.render(msg, True, mc)
+                screen.blit(ml, ml.get_rect(centerx=W//2, y=cam_y+CAM_H+36))
+
+                names = self.db.names()
+                if names:
+                    hint = f_sm.render("Registered: " + ", ".join(names[:6]), True, MUTED)
+                else:
+                    hint = f_sm.render("No users registered — go back and register first.", True, RED)
+                screen.blit(hint, hint.get_rect(centerx=W//2, y=cam_y+CAM_H+62))
+
+            # torch button (always visible)
+            t_label = "[TORCH ON]" if not torch_on else "[TORCH OFF]"
+            t_col   = (255, 200, 0) if not torch_on else (60, 45, 0)
+            t_bg    = (60,  45,  0) if not torch_on else (220,180, 0)
+            t_rect  = pygame.Rect(cam_x + CAM_W + 14, cam_y, 110, 46)
+            pygame.draw.rect(screen, t_bg,  t_rect, border_radius=10)
+            pygame.draw.rect(screen, t_col, t_rect, 2, border_radius=10)
+            screen.blit(f_sm.render(t_label, True, t_col),
+                        f_sm.render(t_label, True, t_col).get_rect(center=t_rect.center))
+            if any(e.type==pygame.MOUSEBUTTONDOWN and e.button==1
+                   and t_rect.collidepoint(e.pos) for e in events):
+                torch_on = not torch_on
+
+            # low-light warning
+            if not torch_on:
+                bv = getattr(self, '_last_brightness', 255)
+                if bv < LOW_LIGHT_THRESH:
+                    warn = f_sm.render(
+                        f"⚠  Too dark ({int(bv)}) — press TORCH ON or turn on a light",
+                        True, AMBER)
+                    wr = warn.get_rect(centerx=W//2, y=H-30)
+                    pygame.draw.rect(screen, (40,25,0), wr.inflate(16,8), border_radius=6)
+                    screen.blit(warn, wr)
+
+            if not locked:
+                btn_back.draw(screen, f_med)
+                if btn_back.hit(events):
+                    return None
+
+            pygame.display.flip()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  REGISTER
+    # ─────────────────────────────────────────────────────────────────────────
+    def _register(self, screen, clock) -> Optional[str]:
+        W, H  = screen.get_size()
+        f_big = _font(34, bold=True)
+        f_med = _font(20, bold=True)
+        f_ui  = _font(16)
+        f_sm  = _font(13)
+
+        CAM_W, CAM_H = 360, 270
+        cam_x = W//2 - CAM_W//2
+        cam_y = 168
+
+        name_box    = TextBox((W//2-180, cam_y-52, 360, 40), "Enter your name…")
+        name_box.active = True
+        btn_capture = Btn((W//2-160, cam_y+CAM_H+24, 320, 52), "CAPTURE FACE", primary=True)
+        btn_back    = Btn((W//2-160, cam_y+CAM_H+90, 320, 46), "BACK")
+
+        phase   = "name"
+        samples = []
+        samp_t  = 0.0
+        SAMP_IV = 0.32
+
+        msg, mc, mt = "Type your name, then press Capture.", CYAN, 0.0
+        torch_on    = False
+        t = 0.0
+
+        while True:
+            dt = clock.tick(60) / 1000.0
+            t += dt
+            mt = max(0.0, mt - dt)
+            events = pygame.event.get()
+            for e in events:
+                if e.type == pygame.QUIT:
+                    pygame.quit(); raise SystemExit
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                    return None
+
+            name_box.handle(events, dt)
+            cam_surf, rects = self._cam_surface(CAM_W, CAM_H)
+
+            if phase == "capturing":
+                if rects and self._cam.gray is not None:
+                    samp_t += dt
+                    if samp_t >= SAMP_IV:
+                        samp_t = 0.0
+                        _rg = getattr(self, '_last_gray', None)
+                        feat = self.engine.extract(_rg, rects[0]) if _rg is not None else None
+                        if feat:
+                            samples.append(feat)
+                            msg, mc, mt = f"Capturing… {len(samples)}/{SAMPLES_NEEDED}", CYAN, 2.0
+                        if len(samples) >= SAMPLES_NEEDED:
+                            uname = name_box.text.strip()
+                            self.db.add(uname, samples)
+                            phase = "done"
+                            msg, mc, mt = f"'{uname}' registered successfully!", GREEN, 99.0
+                else:
+                    msg, mc, mt = "No face visible — look at the camera.", RED, 2.0
+
+            # draw
+            if torch_on:
+                screen.fill(TORCH)
+            else:
+                screen.fill(BG)
+                self._header(screen, W, t, "REGISTER FACE", f_big, f_sm)
+                name_box.draw(screen, f_ui)
+
+            cam_rect = pygame.Rect(cam_x, cam_y, CAM_W, CAM_H)
+            if not torch_on:
+                pygame.draw.rect(screen, PANEL, cam_rect.inflate(6,6), border_radius=12)
+            if cam_surf:
+                screen.blit(cam_surf, (cam_x, cam_y))
+            else:
+                pygame.draw.rect(screen, (18,16,40), cam_rect, border_radius=8)
+            bo = GREEN if phase=="done" else (CYAN if phase=="capturing" else PURPLE)
+            pygame.draw.rect(screen, bo, cam_rect, 2, border_radius=8)
+
+            if not torch_on:
+                dot_y = cam_y + CAM_H + 12
+                for i in range(SAMPLES_NEEDED):
+                    col = GREEN if i < len(samples) else DARK_PU
+                    pygame.draw.circle(screen, col,  (cam_x+20+i*38, dot_y), 8)
+                    pygame.draw.circle(screen, MUTED, (cam_x+20+i*38, dot_y), 8, 1)
+                if mt > 0:
+                    ml = f_ui.render(msg, True, mc)
+                    screen.blit(ml, ml.get_rect(centerx=W//2, y=cam_y+CAM_H+30))
+
+            # torch button
+            t_label = "[TORCH ON]" if not torch_on else "[TORCH OFF]"
+            t_col   = (255, 200, 0) if not torch_on else (60, 45, 0)
+            t_bg    = (60,  45,  0) if not torch_on else (220,180, 0)
+            t_rect  = pygame.Rect(cam_x + CAM_W + 14, cam_y, 110, 46)
+            pygame.draw.rect(screen, t_bg,  t_rect, border_radius=10)
+            pygame.draw.rect(screen, t_col, t_rect, 2, border_radius=10)
+            screen.blit(f_sm.render(t_label, True, t_col),
+                        f_sm.render(t_label, True, t_col).get_rect(center=t_rect.center))
+            if any(e.type==pygame.MOUSEBUTTONDOWN and e.button==1
+                   and t_rect.collidepoint(e.pos) for e in events):
+                torch_on = not torch_on
+
+            if not torch_on:
+                bv = getattr(self, '_last_brightness', 255)
+                if bv < LOW_LIGHT_THRESH:
+                    warn = f_sm.render(
+                        f"⚠  Very dark ({int(bv)}) — use TORCH ON for best results",
+                        True, AMBER)
+                    wr = warn.get_rect(centerx=W//2, y=cam_y+CAM_H+52)
+                    pygame.draw.rect(screen, (40,25,0), wr.inflate(16,8), border_radius=6)
+                    screen.blit(warn, wr)
+
+            if phase == "done":
+                cont = Btn((W//2-160, cam_y+CAM_H+90, 320, 52), "CONTINUE  →", primary=True)
+                cont.draw(screen, f_med)
+                if cont.hit(events):
+                    return name_box.text.strip()
+            else:
+                btn_capture.draw(screen, f_med)
+                btn_back.draw(screen, f_med)
+                if btn_back.hit(events):
+                    return None
+                if btn_capture.hit(events):
+                    uname = name_box.text.strip()
+                    if not uname:
+                        msg, mc, mt = "Enter your name first.", RED, 2.5
+                    elif not rects:
+                        msg, mc, mt = "No face detected — look at the camera.", RED, 2.5
+                    elif self.db.has(uname):
+                        msg, mc, mt = (f"'{uname}' already exists. "
+                                       "Delete them in Manage Users to re-register."), ORANGE, 3.0
+                    else:
+                        phase, samples, samp_t = "capturing", [], 0.0
+                        msg, mc, mt = "Hold still — capturing…", CYAN, 99.0
+
+            pygame.display.flip()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  MANAGE USERS
+    # ─────────────────────────────────────────────────────────────────────────
+    def _manage(self, screen, clock):
+        W, H  = screen.get_size()
+        f_big = _font(34, bold=True)
+        f_med = _font(20, bold=True)
+        f_ui  = _font(16)
+        f_sm  = _font(13)
+
+        btn_back = Btn((W//2-160, H-76, 320, 50), "BACK")
+        t = 0.0
+        msg, mc, mt = "", GREEN, 0.0
+
+        while True:
+            dt = clock.tick(60) / 1000.0
+            t += dt
+            mt = max(0.0, mt - dt)
+            events = pygame.event.get()
+            for e in events:
+                if e.type == pygame.QUIT:
+                    pygame.quit(); raise SystemExit
+                if e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE:
+                    return
+
+            screen.fill(BG)
+            self._header(screen, W, t, "MANAGE USERS", f_big, f_sm)
+
+            keys = self.db.keys()
+            if not keys:
+                nl = f_ui.render("No registered users.", True, MUTED)
+                screen.blit(nl, nl.get_rect(centerx=W//2, y=240))
+            else:
+                for i, key in enumerate(keys):
+                    disp = self.db.display(key)
+                    ry   = 148 + i * 58
+                    pygame.draw.rect(screen, PANEL, (W//2-270, ry, 540, 46), border_radius=8)
+                    pygame.draw.rect(screen, MUTED,  (W//2-270, ry, 540, 46), 1, border_radius=8)
+                    nl = f_med.render(disp, True, TEXT)
+                    screen.blit(nl, (W//2-250, ry+11))
+                    del_btn = Btn((W//2+170, ry+7, 90, 32), "DELETE", danger=True)
+                    del_btn.draw(screen, f_sm)
+                    if del_btn.hit(events):
+                        self.db.delete(key)
+                        msg, mc, mt = f"Deleted '{disp}'.", ORANGE, 3.0
+
+            if msg and mt > 0:
+                ml = f_ui.render(msg, True, mc)
+                screen.blit(ml, ml.get_rect(centerx=W//2, y=H-110))
+
+            btn_back.draw(screen, f_med)
+            if btn_back.hit(events):
+                return
+
+            pygame.display.flip()
