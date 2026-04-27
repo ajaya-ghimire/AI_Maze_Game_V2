@@ -3,7 +3,7 @@ import numpy as np
 import pygame
 from typing import Optional, Tuple, Dict, List
 
-# ─── storage ──────────────────────────────────────────────────────────────────
+# storage 
 FACES_DIR       = "face_data"
 USERS_FILE      = os.path.join(FACES_DIR, "users.pkl")
 SAMPLES_NEEDED  = 15     # frames grabbed during registration
@@ -12,7 +12,7 @@ ORB_RATIO       = 0.55   # kept for reference
 LOW_LIGHT_THRESH = 45    # mean pixel brightness below this = warn
 BOOST_GAMMA      = 0.45  # gamma <1 brightens dark frames
 
-# ─── palette (mirrors game colours) ──────────────────────────────────────────
+# palette (mirrors game colours) 
 BG      = (6,   6,  12)
 PANEL   = (14,  14,  32)
 TEXT    = (220, 228, 240)
@@ -26,7 +26,7 @@ ORANGE  = (250, 110,  20)
 DARK_PU = ( 22,   8,  50)
 YELLOW  = (240, 210,  40)
 AMBER   = (255, 160,  20)
-TORCH   = (255, 252, 235)   # warm white torch flood
+TORCH   = (255, 252, 235)   
 
 def _blend(c1, c2, t):
     t = max(0.0, min(1.0, t))
@@ -172,7 +172,7 @@ class UserDB:
         self._load()
 
     def _load(self):
-        if os.path.exists(USERS_FILE):
+        if os.path.exists(USERS_FILE)\]
             try:
                 with open(USERS_FILE, "rb") as f:
                     self._data = pickle.load(f)
