@@ -1,29 +1,3 @@
-"""
-launch.py
-=========
-Facial-recognition launcher for AI Maze.
-
-How it works
-------------
-1. Opens a Pygame window and shows the face login screen (face_auth.py).
-2. On success (or "Play as Guest"), launches final_mazeT.py in the same process.
-3. Your game file (final_mazeT.py) is NEVER modified.
-
-Usage
------
-    python launch.py
-
-Make sure face_auth.py, final_mazeT.py, and launch.py are in the same folder.
-
-First-time setup
-----------------
-- Run launch.py  →  click REGISTER NEW FACE  →  type your name  →  click CAPTURE FACE.
-- Look at the camera until all 8 dots are filled.
-- Click CONTINUE, then on future runs use FACE LOGIN.
-
-Face data is stored in ./face_data/users.pkl (per-user stats in ai_maze_stats_<name>.json).
-"""
-
 import os
 import sys
 import subprocess
