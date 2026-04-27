@@ -172,7 +172,7 @@ class UserDB:
         self._load()
 
     def _load(self):
-        if os.path.exists(USERS_FILE)\]
+        if os.path.exists(USERS_FILE):
             try:
                 with open(USERS_FILE, "rb") as f:
                     self._data = pickle.load(f)
